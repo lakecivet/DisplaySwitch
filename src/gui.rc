@@ -1,0 +1,13 @@
+/* gui.rc -- DisplaySwitch 图形版资源脚本
+ * 编译：windres src/gui.rc -O coff -o build/gui.res
+ * 用数字 ID，避免依赖 RC 的头文件定义：
+ *   1  = CREATEPROCESS_MANIFEST_RESOURCE_ID / 主图标组 ID
+ *   24 = RT_MANIFEST
+ *   3  = RT_ICON（由 ICON 关键字自动生成）
+ */
+
+/* 应用程序清单（asInvoker + Common Controls v6 + 系统 DPI 感知） */
+1 24 "app.manifest"
+
+/* 程序图标（由 icon.ico 生成图标组，ID=1，资源管理器会采用它） */
+1 ICON "icon.ico"

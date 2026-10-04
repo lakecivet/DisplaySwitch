@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="DisplaySwitch" version="1.0.0.0" processorArchitecture="*"/>
+
+  <!-- 默认不请求管理员权限：只在真正需要时（禁用/启用监视器设备）弹 UAC -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!-- 使用 v6 通用控件（ListView 等有现代外观） -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32"
+                        name="Microsoft.Windows.Common-Controls"
+                        version="6.0.0.0"
+                        processorArchitecture="*"
+                        publicKeyToken="6595b64144ccf1df"
+                        language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <!-- 按系统 DPI 缩放（文字清晰，不模糊） -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+    </windowsSettings>
+  </application>
+</assembly>

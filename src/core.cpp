@@ -1,0 +1,1907 @@
+// =============================================================================
+//  core.cpp  --  DisplaySwitch 核心实现（控制台版与图形版共用）
+//  由原 main.cpp 拆分而来；前端见 main_cli.cpp / main_gui.cpp
+// =============================================================================
+#include "core.h"
+
+#include <shellapi.h>
+
+#include <algorithm>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <cwchar>
+#include <fstream>
+
+// ---------------------------------------------------------------------------
+// 0. 常量兜底（老版本头文件可能没定义）
+// ---------------------------------------------------------------------------
+#ifndef QDC_VIRTUAL_MODE_AWARE
+#define QDC_VIRTUAL_MODE_AWARE 0x00000010
+#endif
+#ifndef SDC_VIRTUAL_MODE_AWARE
+#define SDC_VIRTUAL_MODE_AWARE 0x00008000
+#endif
+#ifndef SDC_PATH_PERSIST_IF_REQUIRED
+#define SDC_PATH_PERSIST_IF_REQUIRED 0x00000800
+#endif
+#ifndef SDC_ALLOW_PATH_ORDER_CHANGES
+#define SDC_ALLOW_PATH_ORDER_CHANGES 0x00002000
+#endif
+// 强制操作系统重新枚举显示模式。新建的 NVIDIA 自定义分辨率如果“看不见”，
+// 用它可以让驱动把模式列表刷新出来，比手动去禁用/重新启用显示器安全得多。
+#ifndef SDC_FORCE_MODE_ENUMERATION
+#define SDC_FORCE_MODE_ENUMERATION 0x00001000
+#endif
+
+namespace fs = std::filesystem;
+
+// 退出码
+
+// ===========================================================================
+// 1. 基础工具
+// ===========================================================================
+std::string Narrow(const std::wstring& w)
+{
+    if (w.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+std::wstring Widen(const std::string& s)
+{
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+std::wstring TrimW(const std::wstring& s)
+{
+    size_t b = s.find_first_not_of(L" \t\r\n");
+    if (b == std::wstring::npos) return L"";
+    size_t e = s.find_last_not_of(L" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+std::wstring LowerW(std::wstring s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](wchar_t c) { return (wchar_t)towlower(c); });
+    return s;
+}
+
+std::wstring QuoteArg(const std::wstring& s)
+{
+    std::wstring out = L"\"";
+    for (wchar_t c : s) {
+        if (c == L'"') out += L'\\';
+        out += c;
+    }
+    out += L"\"";
+    return out;
+}
+
+uint64_t Fnv1a(const void* data, size_t len)
+{
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+std::wstring NowStamp()
+{
+    time_t t = time(nullptr);
+    struct tm lt {};
+    localtime_s(&lt, &t);
+    char buf[64] = {0};
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &lt);
+    return Widen(buf);
+}
+
+// ===========================================================================
+// 2. 日志 / 输出
+// ===========================================================================
+bool        g_logEnabled = true;
+static fs::path    g_logPath;
+bool        g_quiet      = false;
+bool        g_hardReset  = false;   // --hard：先断开再重新挂载显示器，强制驱动刷新模式表
+
+// 输出重定向：图形版把日志送进窗口里的日志框
+static OutputSink g_sink     = nullptr;
+static void*      g_sinkUser = nullptr;
+
+void SetOutputSink(OutputSink sink, void* user)
+{
+    g_sink     = sink;
+    g_sinkUser = user;
+}
+
+void AppendLog(const std::wstring& line)
+{
+    if (!g_logEnabled || g_logPath.empty()) return;
+    std::ofstream f(g_logPath, std::ios::binary | std::ios::app);
+    if (!f) return;
+    std::string s = "[" + Narrow(NowStamp()) + "] " + Narrow(line) + "\r\n";
+    f.write(s.data(), (std::streamsize)s.size());
+}
+
+void Out(const std::wstring& line)
+{
+    AppendLog(line);
+    if (g_sink) { g_sink(line, g_sinkUser); return; }
+    if (!g_quiet) {
+        std::string u = Narrow(line);
+        fputs(u.c_str(), stdout);
+        fputc('\n', stdout);
+        fflush(stdout);
+    }
+}
+
+void OutRaw(const std::wstring& line)   // 不写日志的原始输出
+{
+    if (g_sink) { g_sink(line, g_sinkUser); return; }
+    if (g_quiet) return;
+    std::string u = Narrow(line);
+    fputs(u.c_str(), stdout);
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+
+std::wstring Fmt(const wchar_t* fmt, ...)
+{
+    wchar_t buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnwprintf_s(buf, _countof(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    return std::wstring(buf);
+}
+
+std::string WinErrText(LONG code)
+{
+    if (code == 0) return "ERROR_SUCCESS";
+    LPWSTR msg = nullptr;
+    DWORD n = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                             FORMAT_MESSAGE_IGNORE_INSERTS,
+                             nullptr, (DWORD)code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                             (LPWSTR)&msg, 0, nullptr);
+    std::string s;
+    if (n && msg) {
+        std::wstring w(msg, n);
+        while (!w.empty() && (w.back() == L'\r' || w.back() == L'\n' || w.back() == L' ')) w.pop_back();
+        s = Narrow(w);
+    }
+    if (msg) LocalFree(msg);
+    if (s.empty()) s = "未知错误";
+    return Fmt(L"错误码 %ld (%s)", code, Widen(s).c_str()).empty() ? s
+               : Narrow(Fmt(L"%ld (%s)", code, Widen(s).c_str()));
+}
+
+// ===========================================================================
+// 3. 路径 / 配置
+// ===========================================================================
+
+AppPaths g_paths;
+
+void ResolvePaths()
+{
+    wchar_t buf[MAX_PATH * 4] = {0};
+    DWORD n = GetModuleFileNameW(nullptr, buf, _countof(buf));
+    g_paths.exePath = fs::path(std::wstring(buf, n));
+    g_paths.dir     = g_paths.exePath.parent_path();
+    g_paths.cfg      = g_paths.dir / L"display.cfg";
+    g_paths.dailySnap   = g_paths.dir / L"daily.ccd";
+    g_paths.dailyTxt    = g_paths.dir / L"daily.txt";
+    g_paths.dailyMon    = g_paths.dir / L"daily.mon";
+    g_paths.rollbackSnap = g_paths.dir / L"rollback.ccd";
+    g_paths.rollbackTxt  = g_paths.dir / L"rollback.txt";
+    g_paths.rollbackMon  = g_paths.dir / L"rollback.mon";
+    g_paths.log          = g_paths.dir / L"DisplaySwitch.log";
+    g_logPath = g_paths.log;
+}
+
+
+void CreateDefaultCfgIfMissing()
+{
+    std::error_code ec;
+    if (fs::exists(g_paths.cfg, ec)) return;
+    std::ofstream f(g_paths.cfg, std::ios::binary);
+    if (!f) return;
+    const char* text =
+        "# DisplaySwitch 配置文件 (UTF-8)\r\n"
+        "# 修改后立即生效，无需重新编译。\r\n"
+        "#\r\n"
+        "# ===== 拉伸模式 =====\r\n"
+        "# 拉伸分辨率（显卡真实输出的分辨率，需先在 NVIDIA 控制面板里建好自定义分辨率）\r\n"
+        "stretch_width=1280\r\n"
+        "stretch_height=882\r\n"
+        "# 目标刷新率，0 = 自动挑选该分辨率下最高刷新率\r\n"
+        "stretch_refresh=0\r\n"
+        "# 拉伸画面输出到哪块屏：\r\n"
+        "#   external = 外接显示器/电视（同时禁用笔记本内置屏）\r\n"
+        "#   internal = 笔记本内置屏自己（不禁用任何屏）\r\n"
+        "#   auto     = 有外接屏就用外接屏，没有就用内置屏\r\n"
+        "stretch_target=internal\r\n"
+        "# 1 = 拉伸模式下禁用笔记本内置显示器（只在 stretch_target=external 时生效）\r\n"
+        "keep_external_only=1\r\n"
+        "# 1 = 拉伸模式下禁用目标显示器的「监视器」设备（解除 EDID 对分辨率的限制，\r\n"
+        "#     这正是让 NVIDIA 自定义分辨率真正生效的关键一步，需要管理员权限）\r\n"
+        "stretch_disable_monitor=1\r\n"
+        "# 1 = 回到日常模式时把「监视器」设备强行重新启用\r\n"
+        "# 0 = 按 daily.mon 存档还原成「存基准时」的状态（更安全，推荐）\r\n"
+        "#     很多笔记本的内置屏监视器设备本来就是禁用的，硬去启用会需要管理员\r\n"
+        "#     权限，反而让 daily 每次都失败。\r\n"
+        "daily_enable_monitor=0\r\n"
+        "#\r\n"
+        "# ===== 通用 =====\r\n"
+        "# 切换后等待多少毫秒再校验（显示器重配置是异步的，建议 >=1000）\r\n"
+        "settle_ms=1500\r\n"
+        "# 是否写日志 DisplaySwitch.log\r\n"
+        "log=1\r\n"
+        "# 遇到“拒绝访问”时是否自动以管理员身份重启自己\r\n"
+        "auto_elevate=1\r\n"
+        "# 找不到自定义分辨率时，是否自动打开 NVIDIA 控制面板\r\n"
+        "open_nvcp_on_missing=1\r\n"
+        "# 可选：手工指定哪块屏是「笔记本内置屏」——填显示器名的一部分即可。\r\n"
+        "# 留空表示由程序按接口类型自动判断（eDP / LVDS / INTERNAL 都算内置屏）。\r\n"
+        "# 用 list 命令可以看到每块屏的名字，例如提示里出现 TL160ADMP11-0 就填 TL160ADMP\r\n"
+        "internal_match=\r\n"
+        "# 可选：手工指定要禁用/启用的「监视器」设备。填设备实例ID或硬件ID的一部分，\r\n"
+        "# 例如 DISPLAY\\TMX1601 或 MONITOR\\TMX1601。用 list 命令可以看到候选。\r\n"
+        "monitor_match=\r\n";
+    f.write(text, (std::streamsize)strlen(text));
+}
+
+Config LoadCfg()
+{
+    Config c;
+    std::ifstream f(g_paths.cfg, std::ios::binary);
+    if (!f) return c;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        std::wstring w = TrimW(Widen(line));
+        if (w.empty() || w[0] == L'#' || w[0] == L';') continue;
+        size_t eq = w.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring k = LowerW(TrimW(w.substr(0, eq)));
+        std::wstring v = TrimW(w.substr(eq + 1));
+        auto num = [&](UINT32 def) -> UINT32 {
+            if (v.empty()) return def;
+            return (UINT32)_wtoi(v.c_str());
+        };
+        auto flag = [&](bool def) -> bool {
+            if (v.empty()) return def;
+            return !(v == L"0" || LowerW(v) == L"false" || LowerW(v) == L"no" || LowerW(v) == L"off");
+        };
+        if      (k == L"stretch_width")       c.stretchW = num(c.stretchW);
+        else if (k == L"stretch_height")      c.stretchH = num(c.stretchH);
+        else if (k == L"stretch_refresh")     c.stretchHz = num(c.stretchHz);
+        else if (k == L"stretch_target") {
+            std::wstring t = LowerW(v);
+            if (t == L"internal" || t == L"internal_only" || t == L"builtin") c.stretchTarget = L"internal";
+            else if (t == L"auto")                                            c.stretchTarget = L"auto";
+            else                                                              c.stretchTarget = L"external";
+        }
+        else if (k == L"keep_external_only")  c.keepExternalOnly = flag(c.keepExternalOnly);
+        else if (k == L"settle_ms")           c.settleMs = num(c.settleMs);
+        else if (k == L"log")                 c.logEnabled = flag(c.logEnabled);
+        else if (k == L"auto_elevate")        c.autoElevate = flag(c.autoElevate);
+        else if (k == L"open_nvcp_on_missing")c.openNvcpOnMissing = flag(c.openNvcpOnMissing);
+        else if (k == L"internal_match")      c.internalMatch = v;
+        else if (k == L"monitor_match")       c.monitorMatch = v;
+        else if (k == L"hotkey")              c.hotkey = v;   // 仅图形版使用
+        else if (k == L"stretch_disable_monitor") c.stretchDisableMonitor = flag(c.stretchDisableMonitor);
+        else if (k == L"daily_enable_monitor")    c.dailyEnableMonitor = flag(c.dailyEnableMonitor);
+    }
+    if (c.settleMs < 200) c.settleMs = 200;
+    return c;
+}
+
+// 把配置写回 display.cfg（图形版「保存设置」用）。
+// 写法与 CreateDefaultCfgIfMissing 保持同一套键名，LoadCfg 能原样读回。
+bool SaveCfg(const Config& c, std::wstring& err)
+{
+    auto boolStr = [](bool b) -> const char* { return b ? "1" : "0"; };
+
+    std::string body;
+    body += "# DisplaySwitch 配置（程序保存，手工修改同样有效）\r\n";
+    body += "\r\n; ---------- 拉伸目标 ----------\r\n";
+    body += "# 拉伸时的分辨率（需先在 NVIDIA 控制面板里建好自定义分辨率）\r\n";
+    body += "stretch_width="  + std::to_string(c.stretchW)  + "\r\n";
+    body += "stretch_height=" + std::to_string(c.stretchH)  + "\r\n";
+    body += "stretch_refresh=" + std::to_string(c.stretchHz) + "      # 0=自动取最高刷新率\r\n";
+    body += "# 拉伸目标是哪块屏：internal=笔记本内置屏 / external=外接屏 / auto=自动\r\n";
+    body += "stretch_target=" + Narrow(c.stretchTarget) + "\r\n";
+    body += "\r\n; ---------- 行为开关 ----------\r\n";
+    body += "# 拉伸时是否禁用「监视器」设备节点（禁用后系统不再读 EDID，自定义分辨率才生效）\r\n";
+    body += std::string("stretch_disable_monitor=") + boolStr(c.stretchDisableMonitor) + "\r\n";
+    body += "# 回日常时: 1=强行启用监视器设备 / 0=按存档还原成存基准时的状态（推荐 0）\r\n";
+    body += std::string("daily_enable_monitor=") + boolStr(c.dailyEnableMonitor) + "\r\n";
+    body += "# 拉伸时是否只保留一块活动的屏\r\n";
+    body += std::string("keep_external_only=") + boolStr(c.keepExternalOnly) + "\r\n";
+    body += "# 每次切换后等待画面稳定的毫秒数\r\n";
+    body += "settle_ms=" + std::to_string(c.settleMs) + "\r\n";
+    body += "\r\n; ---------- 其它 ----------\r\n";
+    body += std::string("log=") + boolStr(c.logEnabled) + "\r\n";
+    body += std::string("auto_elevate=") + boolStr(c.autoElevate) + "\r\n";
+    body += std::string("open_nvcp_on_missing=") + boolStr(c.openNvcpOnMissing) + "\r\n";
+    body += "# 手工指定内置屏关键字（留空=按接口类型自动判断）\r\n";
+    body += "internal_match=" + Narrow(c.internalMatch) + "\r\n";
+    body += "# 手工指定要禁用/启用的监视器设备关键字（留空=自动匹配）\r\n";
+    body += "monitor_match=" + Narrow(c.monitorMatch) + "\r\n";
+    body += "# 全局热键，如 Ctrl+Alt+S（仅图形版；留空=不注册）\r\n";
+    body += "hotkey=" + Narrow(c.hotkey) + "\r\n";
+
+    std::ofstream f(g_paths.cfg, std::ios::binary | std::ios::trunc);
+    if (!f) { err = L"无法写入配置文件: " + g_paths.cfg.wstring(); return false; }
+    f.write(body.data(), (std::streamsize)body.size());
+    if (!f) { err = L"写入配置文件失败（磁盘满或只读）"; return false; }
+    f.close();
+    return true;
+}
+
+// 图形版 / 控制台版统一的启动初始化
+Config InitRuntime()
+{
+    ResolvePaths();
+    CreateDefaultCfgIfMissing();
+    Config cfg = LoadCfg();
+    g_logEnabled = cfg.logEnabled;
+    SetConfigMatches(cfg.internalMatch, cfg.monitorMatch);   // 必须在任何显示器枚举之前
+    return cfg;
+}
+
+// ===========================================================================
+// 4. 显示配置快照（二进制存档 + 可读说明）
+// ===========================================================================
+
+#pragma pack(push, 1)
+struct SnapHeader {
+    char     magic[8];      // "DSSNAP02"
+    uint32_t version;
+    uint32_t numPaths;
+    uint32_t numModes;
+    uint32_t pathSize;
+    uint32_t modeSize;
+    uint32_t payloadBytes;
+    uint64_t payloadHash;
+};
+#pragma pack(pop)
+
+static const char kSnapMagic[8] = {'D','S','S','N','A','P','0','2'};
+
+
+// --- CCD 查询 ---------------------------------------------------------------
+LONG QueryConfig(UINT32 flags,
+                        std::vector<DISPLAYCONFIG_PATH_INFO>& paths,
+                        std::vector<DISPLAYCONFIG_MODE_INFO>& modes)
+{
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        UINT32 np = 0, nm = 0;
+        LONG r = GetDisplayConfigBufferSizes(flags, &np, &nm);
+        if (r != ERROR_SUCCESS) return r;
+
+        paths.assign(np ? np : 1, DISPLAYCONFIG_PATH_INFO{});
+        modes.assign(nm ? nm : 1, DISPLAYCONFIG_MODE_INFO{});
+        UINT32 np2 = np, nm2 = nm;
+        r = QueryDisplayConfig(flags, &np2, paths.data(), &nm2, modes.data(), nullptr);
+        if (r == ERROR_INSUFFICIENT_BUFFER) continue;   // 期间显示器热插拔了，重试
+        if (r != ERROR_SUCCESS) return r;
+        paths.resize(np2);
+        modes.resize(nm2);
+        return ERROR_SUCCESS;
+    }
+    return ERROR_INSUFFICIENT_BUFFER;
+}
+
+bool GetTargetName(const LUID& adapterId, UINT32 targetId,
+                          std::wstring& friendly, std::wstring& monitorPath, UINT32& tech)
+{
+    DISPLAYCONFIG_TARGET_DEVICE_NAME tn{};
+    tn.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    tn.header.size      = sizeof(tn);
+    tn.header.adapterId = adapterId;
+    tn.header.id        = targetId;
+    if (DisplayConfigGetDeviceInfo(&tn.header) != ERROR_SUCCESS) return false;
+    friendly    = tn.monitorFriendlyDeviceName;
+    monitorPath = tn.monitorDevicePath;
+    tech        = tn.outputTechnology;
+    return true;
+}
+
+bool GetSourceGdiName(const LUID& adapterId, UINT32 sourceId, std::wstring& gdi)
+{
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME sn{};
+    sn.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+    sn.header.size      = sizeof(sn);
+    sn.header.adapterId = adapterId;
+    sn.header.id        = sourceId;
+    if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS) return false;
+    gdi = sn.viewGdiDeviceName;
+    return true;
+}
+
+// 判断某个输出技术是否属于「笔记本内置屏」。
+// 注意：老系统用 INTERNAL(0x80000000) 表示内置屏，但现代笔记本的 eDP 面板
+//       会被报成 DISPLAYPORT_EMBEDDED(11)，老机器可能是 LVDS(6)/UDI_EMBEDDED(13)。
+//       只认 INTERNAL 会导致内置屏识别失败，所以四个都要认。
+bool IsInternalTech(UINT32 tech)
+{
+    return tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
+        || tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS
+        || tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED
+        || tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED;
+}
+
+// 允许在 display.cfg 里用 internal_match=<显示器名关键字> 手工指定哪块是内置屏，
+// 用 monitor_match=<监视器设备关键字> 手工指定要禁用/启用的「监视器」设备节点
+static std::wstring g_cfgInternalMatch;
+static std::wstring g_cfgMonitorMatch;
+
+void SetConfigMatches(const std::wstring& internalMatch, const std::wstring& monitorMatch)
+{
+    g_cfgInternalMatch = internalMatch;
+    g_cfgMonitorMatch  = monitorMatch;
+}
+
+bool IsInternalDisplay(UINT32 tech, const std::wstring& monitorName)
+{
+    if (!g_cfgInternalMatch.empty()) {
+        return LowerW(monitorName).find(LowerW(g_cfgInternalMatch)) != std::wstring::npos;
+    }
+    return IsInternalTech(tech);
+}
+
+// 用 if 链而非 switch：这些枚举在头文件里被定义成 int，直接做 case 会触发窄化告警
+std::wstring TechName(UINT32 tech)
+{
+    if (tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL)           return L"INTERNAL";
+    if (tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI)               return L"HDMI";
+    if (tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI)                return L"DVI";
+    if (tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL) return L"DP";
+    if (tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED) return L"eDP";
+    if (tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL)       return L"UDI";
+    if (tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15)               return L"VGA";
+    if (tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS)               return L"LVDS";
+    if (tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST)           return L"Miracast";
+    if (tech == (UINT32)DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED)     return L"INDIRECT";
+    return Fmt(L"0x%08X", tech);
+}
+
+// 该路径当前生效的分辨率：优先读 source（桌面像素尺寸），退而读 target 的活动尺寸
+bool PathCurrentMode(const DISPLAYCONFIG_PATH_INFO& p,
+                            const std::vector<DISPLAYCONFIG_MODE_INFO>& modes,
+                            UINT32& w, UINT32& h)
+{
+    UINT32 idx = p.sourceInfo.modeInfoIdx;
+    if (idx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID && idx < modes.size()) {
+        const DISPLAYCONFIG_MODE_INFO& mi = modes[idx];
+        if (mi.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+            w = mi.sourceMode.width; h = mi.sourceMode.height; return true;
+        }
+    }
+    for (const auto& mi : modes) {
+        if (mi.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET &&
+            mi.adapterId.LowPart == p.targetInfo.adapterId.LowPart &&
+            mi.adapterId.HighPart == p.targetInfo.adapterId.HighPart &&
+            mi.id == p.targetInfo.id) {
+            w = mi.targetMode.targetVideoSignalInfo.activeSize.cx;
+            h = mi.targetMode.targetVideoSignalInfo.activeSize.cy;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 该路径在桌面上的左上角坐标
+void PathPosition(const DISPLAYCONFIG_PATH_INFO& p,
+                         const std::vector<DISPLAYCONFIG_MODE_INFO>& modes,
+                         LONG& x, LONG& y)
+{
+    x = y = 0;
+    UINT32 idx = p.sourceInfo.modeInfoIdx;
+    if (idx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID && idx < modes.size() &&
+        modes[idx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+        x = modes[idx].sourceMode.position.x;
+        y = modes[idx].sourceMode.position.y;
+        return;
+    }
+    for (const auto& mi : modes) {
+        if (mi.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE &&
+            mi.id == p.sourceInfo.id &&
+            mi.adapterId.LowPart == p.sourceInfo.adapterId.LowPart &&
+            mi.adapterId.HighPart == p.sourceInfo.adapterId.HighPart) {
+            x = mi.sourceMode.position.x;
+            y = mi.sourceMode.position.y;
+            return;
+        }
+    }
+}
+
+UINT32 PathRefresh(const DISPLAYCONFIG_PATH_INFO& p)
+{
+    if (p.targetInfo.refreshRate.Denominator == 0) return 0;
+    return (UINT32)((double)p.targetInfo.refreshRate.Numerator / p.targetInfo.refreshRate.Denominator + 0.5);
+}
+
+std::vector<DisplayRow> DescribeSnapshot(const Snapshot& s)
+{
+    std::vector<DisplayRow> rows;
+    for (const auto& p : s.paths) {
+        DisplayRow r;
+        std::wstring friendly, mpath;
+        UINT32 tech = 0;
+        GetTargetName(p.targetInfo.adapterId, p.targetInfo.id, friendly, mpath, tech);
+        GetSourceGdiName(p.sourceInfo.adapterId, p.sourceInfo.id, r.gdi);
+        r.monitor    = friendly.empty() ? L"(未知显示器)" : friendly;
+        r.monitorDevicePath = mpath;
+        r.targetId   = p.targetInfo.id;
+        r.technology = TechName(tech);
+        r.internal   = IsInternalDisplay(tech, r.monitor);
+        r.active     = (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0;
+        PathCurrentMode(p, s.modes, r.width, r.height);
+        r.refresh = PathRefresh(p);
+        PathPosition(p, s.modes, r.x, r.y);
+        rows.push_back(r);
+    }
+    return rows;
+}
+
+// --- 存档读写 ---------------------------------------------------------------
+bool SaveSnapshotFile(const fs::path& file, const Snapshot& s, std::wstring& err)
+{
+    SnapHeader hd{};
+    memcpy(hd.magic, kSnapMagic, 8);
+    hd.version      = 2;
+    hd.numPaths     = (uint32_t)s.paths.size();
+    hd.numModes     = (uint32_t)s.modes.size();
+    hd.pathSize     = (uint32_t)sizeof(DISPLAYCONFIG_PATH_INFO);
+    hd.modeSize     = (uint32_t)sizeof(DISPLAYCONFIG_MODE_INFO);
+    size_t pbytes   = s.paths.size() * sizeof(DISPLAYCONFIG_PATH_INFO);
+    size_t mbytes   = s.modes.size() * sizeof(DISPLAYCONFIG_MODE_INFO);
+    hd.payloadBytes = (uint32_t)(pbytes + mbytes);
+
+    std::vector<uint8_t> payload(pbytes + mbytes);
+    if (pbytes) memcpy(payload.data(), s.paths.data(), pbytes);
+    if (mbytes) memcpy(payload.data() + pbytes, s.modes.data(), mbytes);
+    hd.payloadHash = payload.empty() ? 0 : Fnv1a(payload.data(), payload.size());
+
+    std::ofstream f(file, std::ios::binary | std::ios::trunc);
+    if (!f) { err = L"无法写入文件: " + file.wstring(); return false; }
+    f.write((const char*)&hd, sizeof(hd));
+    if (!payload.empty()) f.write((const char*)payload.data(), (std::streamsize)payload.size());
+    if (!f) { err = L"写入存档失败: " + file.wstring(); return false; }
+    return true;
+}
+
+bool LoadSnapshotFile(const fs::path& file, Snapshot& s, std::wstring& err)
+{
+    std::ifstream f(file, std::ios::binary);
+    if (!f) { err = L"找不到存档文件: " + file.wstring(); return false; }
+
+    SnapHeader hd{};
+    f.read((char*)&hd, sizeof(hd));
+    if (!f || memcmp(hd.magic, kSnapMagic, 8) != 0) { err = L"存档格式不正确（magic 不匹配）"; return false; }
+    if (hd.version != 2) { err = Fmt(L"存档版本不支持: %u", hd.version); return false; }
+    if (hd.pathSize != sizeof(DISPLAYCONFIG_PATH_INFO) || hd.modeSize != sizeof(DISPLAYCONFIG_MODE_INFO)) {
+        err = L"存档里的结构体尺寸与本机不一致（可能换了系统/编译器），请重新执行 save";
+        return false;
+    }
+    if (hd.numPaths > 256 || hd.numModes > 1024) { err = L"存档内容异常（数量非法）"; return false; }
+
+    size_t pbytes = (size_t)hd.numPaths * hd.pathSize;
+    size_t mbytes = (size_t)hd.numModes * hd.modeSize;
+    if ((size_t)hd.payloadBytes != pbytes + mbytes) { err = L"存档长度字段不一致，文件已损坏"; return false; }
+
+    std::vector<uint8_t> payload(pbytes + mbytes);
+    if (!payload.empty()) f.read((char*)payload.data(), (std::streamsize)payload.size());
+    if ((size_t)f.gcount() != payload.size()) { err = L"存档数据不完整"; return false; }
+    uint64_t h = payload.empty() ? 0 : Fnv1a(payload.data(), payload.size());
+    if (h != hd.payloadHash) { err = L"存档校验失败（哈希不匹配），文件已损坏"; return false; }
+
+    s.paths.assign(hd.numPaths, DISPLAYCONFIG_PATH_INFO{});
+    s.modes.assign(hd.numModes, DISPLAYCONFIG_MODE_INFO{});
+    if (pbytes) memcpy(s.paths.data(), payload.data(), pbytes);
+    if (mbytes) memcpy(s.modes.data(), payload.data() + pbytes, mbytes);
+    return true;
+}
+
+void WriteReadable(const fs::path& file, const Snapshot& s, const std::wstring& title)
+{
+    std::vector<DisplayRow> rows = DescribeSnapshot(s);
+    std::string txt = "# " + Narrow(title) + "\r\n"
+                      "# 生成时间: " + Narrow(NowStamp()) + "\r\n"
+                      "# 本文件仅供人工排查使用，程序恢复时读取的是同名 .ccd 二进制快照\r\n"
+                      "#\r\n";
+    txt += "display.count=" + std::to_string(rows.size()) + "\r\n";
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const DisplayRow& r = rows[i];
+        std::string pfx = "display." + std::to_string(i) + ".";
+        txt += pfx + "gdi="        + Narrow(r.gdi) + "\r\n";
+        txt += pfx + "monitor="    + Narrow(r.monitor) + "\r\n";
+        txt += pfx + "technology=" + Narrow(r.technology) + "\r\n";
+        txt += pfx + "internal="   + (r.internal ? "1" : "0") + "\r\n";
+        txt += pfx + "active="     + (r.active ? "1" : "0") + "\r\n";
+        txt += pfx + "width="      + std::to_string(r.width) + "\r\n";
+        txt += pfx + "height="     + std::to_string(r.height) + "\r\n";
+        txt += pfx + "refresh="    + std::to_string(r.refresh) + "\r\n";
+        txt += pfx + "x="          + std::to_string(r.x) + "\r\n";
+        txt += pfx + "y="          + std::to_string(r.y) + "\r\n";
+    }
+    // 可读说明里附上原始副本，方便极端情况下手工分析
+    txt += "\r\n# ==== 以下为无法解析的附加信息 ====\r\n";
+    txt += "raw.paths=" + std::to_string(s.paths.size()) + "\r\n";
+    txt += "raw.modes=" + std::to_string(s.modes.size()) + "\r\n";
+
+    std::ofstream f(file, std::ios::binary | std::ios::trunc);
+    if (f) f.write(txt.data(), (std::streamsize)txt.size());
+}
+
+// 从可读说明里读取「日常配置」的期望分辨率（用于降级恢复）
+std::vector<DisplayRow> ReadReadableRows(const fs::path& file)
+{
+    std::vector<DisplayRow> rows;
+    std::ifstream f(file, std::ios::binary);
+    if (!f) return rows;
+    std::vector<std::wstring> lines;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(Widen(line));
+    }
+    auto get = [&](size_t idx, const std::wstring& key, std::wstring& out) -> bool {
+        std::wstring want = L"display." + std::to_wstring(idx) + L"." + key + L"=";
+        for (const auto& l : lines) {
+            std::wstring t = TrimW(l);
+            if (t.size() >= want.size() && _wcsnicmp(t.c_str(), want.c_str(), want.size()) == 0) {
+                out = TrimW(t.substr(want.size()));
+                return true;
+            }
+        }
+        return false;
+    };
+    UINT32 cnt = 0;
+    for (const auto& l : lines) {
+        std::wstring t = TrimW(l);
+        if (_wcsnicmp(t.c_str(), L"display.count=", 14) == 0) cnt = (UINT32)_wtoi(t.c_str() + 14);
+    }
+    for (UINT32 i = 0; i < cnt; ++i) {
+        DisplayRow r;
+        std::wstring v;
+        if (get(i, L"gdi", v)) r.gdi = v;
+        if (get(i, L"monitor", v)) r.monitor = v;
+        if (get(i, L"technology", v)) r.technology = v;
+        if (get(i, L"internal", v)) r.internal = (_wtoi(v.c_str()) != 0);
+        if (get(i, L"active", v)) r.active = (_wtoi(v.c_str()) != 0);
+        if (get(i, L"width", v)) r.width = (UINT32)_wtoi(v.c_str());
+        if (get(i, L"height", v)) r.height = (UINT32)_wtoi(v.c_str());
+        if (get(i, L"refresh", v)) r.refresh = (UINT32)_wtoi(v.c_str());
+        if (get(i, L"x", v)) r.x = (LONG)_wtoi(v.c_str());
+        if (get(i, L"y", v)) r.y = (LONG)_wtoi(v.c_str());
+        rows.push_back(r);
+    }
+    return rows;
+}
+
+// ===========================================================================
+// 5. GDI 分辨率相关
+// ===========================================================================
+
+std::vector<GdiMode> EnumGdiModes(const std::wstring& gdiName)
+{
+    std::vector<GdiMode> out;
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(DEVMODEW);
+    for (DWORD i = 0; EnumDisplaySettingsExW(gdiName.c_str(), i, &dm, 0); ++i) {
+        if (dm.dmBitsPerPel < 16) continue;
+        bool dup = false;
+        for (const auto& m : out) {
+            if (m.w == dm.dmPelsWidth && m.h == dm.dmPelsHeight &&
+                m.hz == dm.dmDisplayFrequency && m.bpp == dm.dmBitsPerPel) { dup = true; break; }
+        }
+        if (dup) continue;
+        GdiMode m;
+        m.w = dm.dmPelsWidth; m.h = dm.dmPelsHeight;
+        m.bpp = dm.dmBitsPerPel; m.hz = dm.dmDisplayFrequency;
+        if (m.hz == 0) m.hz = 60;   // 0/1 表示“默认”
+        out.push_back(m);
+        if (i > 4000) break;
+    }
+    return out;
+}
+
+// 在可用模式里挑一个最合适的
+bool PickGdiMode(const std::vector<GdiMode>& modes, UINT32 w, UINT32 h, UINT32 wantHz, GdiMode& best)
+{
+    bool found = false;
+    for (const auto& m : modes) {
+        if (m.w != w || m.h != h) continue;
+        if (m.bpp < 32) continue;
+        if (!found) { best = m; found = true; continue; }
+        if (wantHz) {
+            // 优先等于目标刷新率
+            if (m.hz == wantHz) { best = m; }
+            else if (best.hz != wantHz && m.hz > best.hz) { best = m; }
+        } else {
+            if (m.hz > best.hz) best = m;
+        }
+    }
+    if (!found) {  // 放宽到 24/16 位色
+        for (const auto& m : modes) {
+            if (m.w == w && m.h == h) { if (!found || m.hz > best.hz) best = m; found = true; }
+        }
+    }
+    return found;
+}
+
+std::wstring DispChangeText(LONG code)
+{
+    switch (code) {
+    case DISP_CHANGE_SUCCESSFUL:  return L"成功";
+    case DISP_CHANGE_RESTART:     return L"需要重启才能生效";
+    case DISP_CHANGE_FAILED:      return L"显示驱动拒绝了该模式 (DISP_CHANGE_FAILED)";
+    case DISP_CHANGE_BADMODE:     return L"该显示模式不被支持 (DISP_CHANGE_BADMODE)";
+    case DISP_CHANGE_NOTUPDATED:  return L"无法写入注册表 (DISP_CHANGE_NOTUPDATED)";
+    case DISP_CHANGE_BADFLAGS:    return L"参数标志非法 (DISP_CHANGE_BADFLAGS)";
+    case DISP_CHANGE_BADPARAM:    return L"参数非法 (DISP_CHANGE_BADPARAM)";
+    case DISP_CHANGE_BADDUALVIEW: return L"不支持双屏显示 (DISP_CHANGE_BADDUALVIEW)";
+    default: break;
+    }
+    return Fmt(L"未知返回码 %ld", code);
+}
+
+LONG ApplyGdiMode(const std::wstring& gdiName, const GdiMode& m, DWORD extra = CDS_UPDATEREGISTRY)
+{
+    DEVMODEW dm{};
+    dm.dmSize            = sizeof(DEVMODEW);
+    dm.dmPelsWidth       = m.w;
+    dm.dmPelsHeight      = m.h;
+    dm.dmBitsPerPel      = m.bpp;
+    dm.dmDisplayFrequency = m.hz;
+    dm.dmFields          = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
+    return ChangeDisplaySettingsExW(gdiName.c_str(), &dm, nullptr, extra, nullptr);
+}
+
+// ===========================================================================
+// 5b. 「监视器」设备管理（设备管理器 -> 监视器）
+// ---------------------------------------------------------------------------
+//  为什么必须做这一步：
+//    显示器的 EDID 里写死了它「官方支持」的时序。Windows 通过「监视器」设备
+//    节点把 EDID 读进来，显卡据此限制可选分辨率列表。把这个设备节点禁用掉，
+//    系统就不再受 EDID 约束，NVIDIA 控制面板里创建的自定义分辨率（1280x882）
+//    才能真正被应用 —— 这就是你说的「先禁用笔记本监视器」那一步的真实作用。
+//  对应系统命令：pnputil /disable-device "<实例ID>"  /  /enable-device
+//  本程序直接调用其底层 API：CfgMgr32 的 CM_Disable_DevNode / CM_Enable_DevNode
+//  注意：这一步需要管理员权限。
+// ===========================================================================
+// {4d36e96e-e325-11ce-bfc1-08002be10318}  = Monitor 设备类
+static const GUID kMonitorClassGuid = {0x4d36e96e, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+
+
+std::wstring CrText(CONFIGRET cr)
+{
+    if (cr == CR_SUCCESS)         return L"成功";
+    if (cr == CR_ACCESS_DENIED)   return L"拒绝访问（需要管理员权限）";
+    if (cr == CR_NO_SUCH_DEVNODE) return L"设备不存在";
+    if (cr == CR_INVALID_DEVNODE) return L"设备句柄无效";
+    if (cr == CR_NOT_DISABLEABLE) return L"该设备不支持禁用";
+    if (cr == CR_REMOVE_VETOED)   return L"被驱动程序拒绝";
+    if (cr == CR_FAILURE)         return L"操作失败";
+    return Fmt(L"CONFIGRET 0x%lX", (unsigned long)cr);
+}
+
+std::vector<MonitorDev> EnumMonitorDevices()
+{
+    std::vector<MonitorDev> out;
+    HDEVINFO h = SetupDiGetClassDevsW(&kMonitorClassGuid, nullptr, nullptr, DIGCF_PRESENT);
+    if (h == INVALID_HANDLE_VALUE) return out;
+
+    auto getProp = [&](SP_DEVINFO_DATA& d, DWORD id) -> std::wstring {
+        wchar_t b[1024] = {0};
+        DWORD need = 0;
+        if (SetupDiGetDeviceRegistryPropertyW(h, &d, id, nullptr, (PBYTE)b, sizeof(b), &need))
+            return std::wstring(b);   // 多字符串取第一条
+        return std::wstring();
+    };
+
+    SP_DEVINFO_DATA d{};
+    d.cbSize = sizeof(d);
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(h, i, &d); ++i) {
+        MonitorDev m;
+        m.devInst = d.DevInst;
+        wchar_t iid[512] = {0};
+        if (SetupDiGetDeviceInstanceIdW(h, &d, iid, 512, nullptr)) m.instanceId = iid;
+        m.hardwareId = getProp(d, SPDRP_HARDWAREID);
+        m.desc       = getProp(d, SPDRP_FRIENDLYNAME);
+        if (m.desc.empty()) m.desc = getProp(d, SPDRP_DEVICEDESC);
+        ULONG status = 0, problem = 0;
+        if (CM_Get_DevNode_Status(&status, &problem, d.DevInst, 0) == CR_SUCCESS) {
+            m.started     = (status & DN_STARTED) != 0;
+            m.disableable = (status & DN_DISABLEABLE) != 0;
+            if (status & DN_HAS_PROBLEM) m.problem = problem;
+            m.disabled = (m.problem == (ULONG)CM_PROB_DISABLED);
+        }
+        out.push_back(m);
+    }
+    SetupDiDestroyDeviceInfoList(h);
+    return out;
+}
+
+// 把某块 CCD 显示器映射到它的「监视器」设备节点
+int MatchMonitorDev(const std::vector<MonitorDev>& devs, const DisplayRow& row)
+{
+    // 1) display.cfg 里手工指定的关键字优先
+    if (!g_cfgMonitorMatch.empty()) {
+        std::wstring k = LowerW(g_cfgMonitorMatch);
+        for (size_t i = 0; i < devs.size(); ++i)
+            if (LowerW(devs[i].instanceId).find(k) != std::wstring::npos ||
+                LowerW(devs[i].hardwareId).find(k) != std::wstring::npos) return (int)i;
+        return -1;
+    }
+    // 2) CCD 的 monitorDevicePath：\\?\DISPLAY#TMX1601#4&...
+    if (!row.monitorDevicePath.empty()) {
+        size_t a = row.monitorDevicePath.find(L"DISPLAY#");
+        if (a != std::wstring::npos) {
+            size_t b = row.monitorDevicePath.find(L'#', a + 8);
+            if (b != std::wstring::npos) {
+                std::wstring pnp = LowerW(row.monitorDevicePath.substr(a + 8, b - a - 8));
+                for (size_t i = 0; i < devs.size(); ++i)
+                    if (LowerW(devs[i].instanceId).find(pnp) != std::wstring::npos ||
+                        LowerW(devs[i].hardwareId).find(pnp) != std::wstring::npos) return (int)i;
+            }
+        }
+    }
+    // 3) 设备实例 ID 末尾的 UID<数字> 通常就是 CCD 的 target id
+    if (row.targetId) {
+        std::wstring uidTag = LowerW(L"UID" + std::to_wstring(row.targetId));
+        for (size_t i = 0; i < devs.size(); ++i)
+            if (LowerW(devs[i].instanceId).find(uidTag) != std::wstring::npos) return (int)i;
+    }
+    // 4) 只有一块监视器设备时直接用
+    if (devs.size() == 1) return 0;
+    return -1;
+}
+
+bool SetMonitorDisabled(const MonitorDev& m, bool disable, std::wstring& err)
+{
+    if (m.devInst == 0) { err = L"设备句柄无效"; return false; }
+    CONFIGRET cr = disable ? CM_Disable_DevNode(m.devInst, 0)
+                           : CM_Enable_DevNode(m.devInst, 0);
+    if (cr != CR_SUCCESS) {
+        err = Fmt(L"%s监视器设备失败: %s", disable ? L"禁用" : L"启用", CrText(cr).c_str());
+        return false;
+    }
+    // 设备状态是异步生效的，轮询等待
+    for (int i = 0; i < 40; ++i) {
+        Sleep(200);
+        ULONG status = 0, problem = 0;
+        if (CM_Get_DevNode_Status(&status, &problem, m.devInst, 0) != CR_SUCCESS) break;
+        bool nowDisabled = ((status & DN_HAS_PROBLEM) != 0) && (problem == (ULONG)CM_PROB_DISABLED);
+        if (nowDisabled == disable) return true;
+    }
+    err = L"监视器设备状态等待超时（可能已生效，但未能确认）";
+    return false;
+}
+
+// --- 监视器状态的存档（纯文本，一行一个设备）---
+bool SaveMonitorStateFile(const fs::path& f, const std::vector<MonitorDev>& devs, std::wstring& err)
+{
+    std::ofstream out(f, std::ios::binary | std::ios::trunc);
+    if (!out) { err = L"无法写入 " + f.wstring(); return false; }
+    out << "# DisplaySwitch 监视器设备状态存档\r\n";
+    out << "# 每行: 设备实例ID|是否已禁用(1/0)\r\n";
+    for (const auto& d : devs) out << Narrow(d.instanceId) << "|" << (d.disabled ? 1 : 0) << "\r\n";
+    return true;
+}
+
+std::vector<std::pair<std::wstring, bool>> LoadMonitorStateFile(const fs::path& f)
+{
+    std::vector<std::pair<std::wstring, bool>> out;
+    std::ifstream in(f, std::ios::binary);
+    if (!in) return out;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        size_t p = line.rfind('|');
+        if (p == std::string::npos) continue;
+        out.push_back({Widen(line.substr(0, p)), line.substr(p + 1) == "1"});
+    }
+    return out;
+}
+
+// 按存档把监视器设备状态改回去（返回是否有改动失败）
+bool RestoreMonitorState(const fs::path& f, std::wstring& detail)
+{
+    auto want = LoadMonitorStateFile(f);
+    if (want.empty()) { detail += L"（无监视器状态存档）"; return false; }
+    auto devs = EnumMonitorDevices();
+    bool allOk = true;
+    for (const auto& w : want) {
+        int idx = -1;
+        for (size_t i = 0; i < devs.size(); ++i)
+            if (LowerW(devs[i].instanceId) == LowerW(w.first)) { idx = (int)i; break; }
+        if (idx < 0) continue;
+        if (devs[idx].disabled == w.second) continue;
+        std::wstring e;
+        if (!SetMonitorDisabled(devs[idx], w.second, e)) { allOk = false; detail += e + L"; "; }
+    }
+    if (allOk) detail += L"监视器状态已还原";
+    return allOk;
+}
+
+// ===========================================================================
+// 6. 应用（拓扑 / 快照 / 回滚）
+// ===========================================================================
+static bool g_lastErrorNeedsAdmin = false;
+
+LONG ApplySnapshotCcd(const Snapshot& s, bool allowChanges)
+{
+    UINT32 flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE;
+    if (allowChanges) flags |= SDC_ALLOW_CHANGES | SDC_PATH_PERSIST_IF_REQUIRED | SDC_ALLOW_PATH_ORDER_CHANGES;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths = s.paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes = s.modes;
+    LONG r = SetDisplayConfig((UINT32)paths.size(), paths.empty() ? nullptr : paths.data(),
+                              (UINT32)modes.size(), modes.empty() ? nullptr : modes.data(), flags);
+    if (r == ERROR_ACCESS_DENIED) g_lastErrorNeedsAdmin = true;
+    return r;
+}
+
+LONG ApplyTopologyExternal()
+{
+    LONG r = SetDisplayConfig(0, nullptr, 0, nullptr,
+                              SDC_TOPOLOGY_EXTERNAL | SDC_APPLY | SDC_SAVE_TO_DATABASE);
+    if (r == ERROR_ACCESS_DENIED) {
+        g_lastErrorNeedsAdmin = true;
+        r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTERNAL | SDC_APPLY);
+    }
+    return r;
+}
+
+LONG ApplyTopologyExtend()
+{
+    LONG r = SetDisplayConfig(0, nullptr, 0, nullptr,
+                              SDC_TOPOLOGY_EXTEND | SDC_APPLY | SDC_SAVE_TO_DATABASE);
+    if (r == ERROR_ACCESS_DENIED) {
+        g_lastErrorNeedsAdmin = true;
+        r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
+    }
+    return r;
+}
+
+// 强制系统重新枚举显示模式（不会改变任何现有显示设置，安全）
+LONG ForceModeReenumeration()
+{
+    Snapshot cur;
+    if (QueryConfig(QDC_ONLY_ACTIVE_PATHS, cur.paths, cur.modes) != ERROR_SUCCESS)
+        return ERROR_INVALID_PARAMETER;
+    if (cur.paths.empty()) return ERROR_INVALID_PARAMETER;
+    LONG r = SetDisplayConfig((UINT32)cur.paths.size(), cur.paths.data(),
+                              (UINT32)cur.modes.size(), cur.modes.data(),
+                              SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+                              SDC_FORCE_MODE_ENUMERATION);
+    if (r == ERROR_ACCESS_DENIED) g_lastErrorNeedsAdmin = true;
+    return r;
+}
+
+// 关掉所有输出（会黑屏）。只在 --hard 模式下、并且手上有可靠的回滚快照时才调用。
+LONG DetachAllDisplays()
+{
+    LONG r = SetDisplayConfig(0, nullptr, 0, nullptr,
+                              SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG);
+    if (r == ERROR_ACCESS_DENIED) g_lastErrorNeedsAdmin = true;
+    return r;
+}
+
+// 显式构造「去掉内置屏」的路径数组（SDC_TOPOLOGY_EXTERNAL 的兜底方案）
+LONG ApplyDeactivateInternal(const Snapshot& cur)
+{
+    std::vector<DisplayRow> rows = DescribeSnapshot(cur);
+    std::vector<DISPLAYCONFIG_PATH_INFO> keep;
+    for (size_t i = 0; i < cur.paths.size(); ++i) {
+        if (i < rows.size() && rows[i].internal) continue;   // 丢掉内置屏
+        DISPLAYCONFIG_PATH_INFO q = cur.paths[i];
+        q.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+        q.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        keep.push_back(q);
+    }
+    if (keep.empty()) return ERROR_INVALID_PARAMETER;
+    LONG r = SetDisplayConfig((UINT32)keep.size(), keep.data(), 0, nullptr,
+                              SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES |
+                              SDC_PATH_PERSIST_IF_REQUIRED | SDC_ALLOW_PATH_ORDER_CHANGES);
+    if (r == ERROR_ACCESS_DENIED) g_lastErrorNeedsAdmin = true;
+    return r;
+}
+
+
+bool ReadLive(LiveState& ls)
+{
+    LONG r = QueryConfig(QDC_ONLY_ACTIVE_PATHS, ls.snap.paths, ls.snap.modes);
+    if (r != ERROR_SUCCESS) return false;
+    ls.rows = DescribeSnapshot(ls.snap);
+    ls.internalActive = false;
+    ls.internalCount  = 0;
+    ls.externalActive = 0;
+    ls.internalW = ls.internalH = ls.internalHz = 0;
+    ls.externalW = ls.externalH = ls.externalHz = 0;
+    ls.externalGdi.clear();
+    ls.internalGdi.clear();
+    for (size_t i = 0; i < ls.rows.size(); ++i) {
+        const DisplayRow& d = ls.rows[i];
+        if (!d.active) continue;
+        if (d.internal) {
+            ls.internalActive = true;
+            ++ls.internalCount;
+            if (ls.internalGdi.empty()) {
+                ls.internalGdi  = d.gdi;
+                ls.internalW    = d.width;
+                ls.internalH    = d.height;
+                ls.internalHz   = d.refresh;
+            }
+        } else {
+            ++ls.externalActive;
+            if (ls.externalGdi.empty()) {
+                ls.externalGdi  = d.gdi;
+                ls.externalW    = d.width;
+                ls.externalH    = d.height;
+                ls.externalHz   = d.refresh;
+            }
+        }
+    }
+    return true;
+}
+
+// 判断当前状态是否与某个存档一致（用于校验与“是否已在该模式”判断）
+bool LiveMatches(const Snapshot& want, const LiveState& live)
+{
+    std::vector<DisplayRow> wrows = DescribeSnapshot(want);
+    for (const auto& w : wrows) {
+        if (!w.active) continue;
+        bool found = false;
+        for (const auto& l : live.rows) {
+            if (!l.active) continue;
+            bool nameOk = (!w.monitor.empty() && !l.monitor.empty()) ? (l.monitor == w.monitor)
+                                                                     : (l.technology == w.technology);
+            if (!nameOk) continue;
+            if (w.width && w.height && (l.width != w.width || l.height != w.height)) continue;
+            found = true;
+            break;
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+// 回滚到指定快照（先还原监视器设备状态，再逐级降级还原显示配置）
+bool RollbackTo(const Snapshot& target, const fs::path& monStateFile, std::wstring& detail)
+{
+    detail.clear();
+
+    // 先把「监视器」设备状态还原（否则可能因为 EDID 约束而设不回分辨率）
+    std::error_code ec;
+    if (!monStateFile.empty() && fs::exists(monStateFile, ec)) {
+        std::wstring md;
+        RestoreMonitorState(monStateFile, md);
+        detail += md + L"；";
+    }
+
+    if (target.empty()) { detail += L"没有可用的回滚快照"; return false; }
+
+    LONG r = ApplySnapshotCcd(target, false);
+    if (r != ERROR_SUCCESS) r = ApplySnapshotCcd(target, true);
+    if (r == ERROR_SUCCESS) { detail += L"显示配置已用存档恢复"; return true; }
+
+    // 降级 1：只恢复拓扑，再逐屏设回分辨率
+    LONG tr = ApplyTopologyExtend();
+    if (tr == ERROR_SUCCESS) {
+        bool allOk = true;
+        for (const auto& row : DescribeSnapshot(target)) {
+            if (!row.active || row.gdi.empty() || row.width == 0) continue;
+            GdiMode m; m.w = row.width; m.h = row.height; m.bpp = 32; m.hz = row.refresh ? row.refresh : 60;
+            LONG cr = ApplyGdiMode(row.gdi, m);
+            if (cr != DISP_CHANGE_SUCCESSFUL) {
+                auto avail = EnumGdiModes(row.gdi);
+                if (PickGdiMode(avail, m.w, m.h, m.hz, m)) cr = ApplyGdiMode(row.gdi, m);
+            }
+            if (cr != DISP_CHANGE_SUCCESSFUL) allOk = false;
+        }
+        detail += allOk ? L"已用降级方式（拓扑+逐屏分辨率）恢复" : L"降级恢复部分成功";
+        return true;
+    }
+    detail += Fmt(L"回滚失败: %s / %s", DispChangeText(r).c_str(), WinErrText(tr).c_str());
+    return false;
+}
+
+// ===========================================================================
+// 7. 各命令实现
+// ===========================================================================
+const wchar_t* kUsage =
+    L"DisplaySwitch —— 真实拉伸 / 日常 显示模式一键切换\n"
+    L"\n"
+    L"用法:  DisplaySwitch.exe <命令> [选项]\n"
+    L"\n"
+    L"命令:\n"
+    L"  list         列出所有显示器、当前分辨率与已保存的日常配置\n"
+    L"  save         把当前显示配置保存为「日常模式」基准（请在日常状态下执行）\n"
+    L"               可选: save --force  强制覆盖旧基准\n"
+    L"  stretch      切到拉伸模式：禁用内置屏 + 外接屏切到 1280x882\n"
+    L"               别名: go / on\n"
+    L"  daily        还原日常模式（内置屏 2560x1600 等）\n"
+    L"               别名: back / off / restore\n"
+    L"  toggle       智能切换：内置屏亮着 -> 拉伸；内置屏关着 -> 日常\n"
+    L"  status       查看当前状态与配置是否一致\n"
+    L"  emergency    紧急恢复：从 rollback.ccd 强制还原（黑屏自救用）\n"
+    L"  nvcp         打开 NVIDIA 控制面板（手工新建自定义分辨率）\n"
+    L"  where        打印程序目录与各文件位置\n"
+    L"\n"
+    L"通用选项:\n"
+    L"  --force         强制执行（参数不足时是否写基准）\n"
+    L"  --hard          拉伸前先断开再重新挂载显示器（强制刷新模式表，会短暂黑屏）\n"
+    L"  --quiet         只写日志，不打印\n"
+    L"  --no-elevate    不要自动提权\n"
+    L"  --settle=毫秒    覆盖配置里的 settle_ms\n"
+    L"  --res=宽x高      覆盖拉伸目标分辨率，例如 --res=1280x882\n"
+    L"  --help          显示本帮助\n";
+
+void PrintMonitorDevices()
+{
+    std::vector<MonitorDev> devs = EnumMonitorDevices();
+    Out(L"");
+    Out(L"==== 监视器设备（设备管理器 -> 监视器）====");
+    if (devs.empty()) {
+        Out(L"  (没有枚举到监视器设备；可能需要管理员权限)");
+        return;
+    }
+    for (size_t i = 0; i < devs.size(); ++i) {
+        Out(Fmt(L"  [%zu] %-8s  %-20s  %s",
+                i,
+                devs[i].disabled ? L"已禁用" : (devs[i].started ? L"正常" : L"未启动"),
+                devs[i].hardwareId.c_str(),
+                devs[i].instanceId.c_str()));
+        Out(L"       " + (devs[i].desc.empty() ? std::wstring(L"(无描述)") : devs[i].desc) +
+            Fmt(L"   可禁用=%s  问题码=%lu",
+                devs[i].disableable ? L"是" : L"否", devs[i].problem));
+    }
+    Out(L"  说明: 拉伸模式会禁用目标显示器的监视器设备（解除 EDID 限制），");
+    Out(L"        日常模式会把它重新启用。");
+}
+
+void PrintRows(const std::vector<DisplayRow>& rows, const std::wstring& indent = L"    ")
+{
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const DisplayRow& r = rows[i];
+        Out(indent + Fmt(L"[%zu] %-6s %-12s GDI=%-14s 分辨率=%ux%u@%uHz 位置=(%ld,%ld)  显示器=\"%s\"",
+                         i,
+                         r.active ? L"启用" : L"停用",
+                         r.technology.c_str(),
+                         r.gdi.empty() ? L"-" : r.gdi.c_str(),
+                         r.width, r.height, r.refresh,
+                         r.x, r.y,
+                         r.monitor.c_str()) +
+            (r.internal ? L"  <内置屏>" : L""));
+    }
+}
+
+int CmdList(const Config& cfg)
+{
+    Out(L"==== 当前活动的显示器 ====");
+    Snapshot s;
+    LONG r = QueryConfig(QDC_ONLY_ACTIVE_PATHS, s.paths, s.modes);
+    if (r != ERROR_SUCCESS) {
+        Out(Fmt(L"[!] 查询显示配置失败: %s", WinErrText(r).c_str()));
+        return EXIT_PRECHECK;
+    }
+    auto rows = DescribeSnapshot(s);
+    PrintRows(rows);
+    Out(Fmt(L"  合计: %zu 个活动输出", rows.size()));
+
+    Out(L"");
+    Out(L"==== 每个显示器可用的分辨率 ====");
+    for (const auto& d : rows) {
+        if (d.gdi.empty()) continue;
+        auto modes = EnumGdiModes(d.gdi);
+        std::wstring line = L"  " + d.gdi + L" (" + d.monitor + L"): ";
+        std::vector<std::wstring> uniq;
+        for (const auto& m : modes) {
+            std::wstring t = Fmt(L"%ux%u", m.w, m.h);
+            if (std::find(uniq.begin(), uniq.end(), t) == uniq.end()) uniq.push_back(t);
+        }
+        size_t show = uniq.size() < 40 ? uniq.size() : 40;
+        for (size_t i = 0; i < show; ++i) line += uniq[i] + (i + 1 < show ? L" " : L"");
+        if (uniq.size() > show) line += Fmt(L" ...(共 %zu 种)", uniq.size());
+        Out(line);
+
+        GdiMode probe;
+        if (PickGdiMode(modes, cfg.stretchW, cfg.stretchH, cfg.stretchHz, probe)) {
+            Out(Fmt(L"      -> 拉伸目标 %ux%u 已存在（可选用 %uHz）",
+                    cfg.stretchW, cfg.stretchH, probe.hz));
+        } else {
+            Out(Fmt(L"      -> 拉伸目标 %ux%u 【不存在】，需要先用 NVIDIA 控制面板创建：",
+                    cfg.stretchW, cfg.stretchH));
+            Out(L"         桌面右键 -> NVIDIA 控制面板 -> 显示 -> 更改分辨率 -> 自定义 -> 创建自定义分辨率");
+        }
+    }
+
+    Out(L"");
+    Out(L"==== 已保存的日常配置 ====");
+    Snapshot d;
+    std::wstring err;
+    if (LoadSnapshotFile(g_paths.dailySnap, d, err)) {
+        PrintRows(DescribeSnapshot(d));
+    } else {
+        Out(L"  (尚未保存)  请先在“日常模式”下执行:  DisplaySwitch.exe save");
+    }
+
+    PrintMonitorDevices();
+
+    Out(L"");
+    Out(L"==== 拉伸模式目标 ====");
+    Out(Fmt(L"  分辨率: %ux%u   刷新率: %s",
+            cfg.stretchW, cfg.stretchH,
+            cfg.stretchHz ? Fmt(L"%u Hz", cfg.stretchHz).c_str() : L"自动(最高)"));
+    Out(L"  输出到: " + (cfg.stretchTarget == L"internal" ? std::wstring(L"笔记本内置屏（不禁用任何屏）")
+                       : cfg.stretchTarget == L"auto"     ? std::wstring(L"自动判断")
+                       : std::wstring(L"外接显示器")));
+    Out(Fmt(L"  禁用内置屏: %s", cfg.keepExternalOnly ? L"是" : L"否"));
+    if (cfg.stretchTarget == L"external") {
+        int extCnt = 0;
+        for (const auto& r2 : rows) if (!r2.internal) ++extCnt;
+        if (extCnt == 0) {
+            Out(L"  [!] 当前没有活动的外接显示器，stretch 会直接报错退出。");
+            Out(L"      若你的玩法就是内置屏拉伸，请把 display.cfg 改成 stretch_target=internal");
+        }
+    }
+    return EXIT_OK;
+}
+
+int CmdSave(const Config& cfg, bool force)
+{
+    (void)cfg;
+    LiveState ls;
+    if (!ReadLive(ls)) { Out(L"[!] 无法读取当前显示配置"); return EXIT_PRECHECK; }
+
+    Snapshot cur;
+    LONG r = QueryConfig(QDC_ONLY_ACTIVE_PATHS, cur.paths, cur.modes);
+    if (r != ERROR_SUCCESS) { Out(L"[!] 无法读取当前显示配置"); return EXIT_PRECHECK; }
+    if (cur.paths.empty()) { Out(L"[!] 当前没有任何活动显示器，拒绝保存"); return EXIT_PRECHECK; }
+
+    // 安全检查：如果内置屏已经关掉了，很可能正处在拉伸模式，别把拉伸状态当成日常基准
+    if (!ls.internalActive && !force) {
+        Out(L"[!] 当前没有检测到活动的内置显示器，说明你可能正处于拉伸模式。");
+        Out(L"    若把现在保存成日常基准，之后 daily 就会还原到拉伸画面。");
+        Out(L"    如果确认要在当前状态下保存，请加 --force。");
+        return EXIT_PRECHECK;
+    }
+
+    std::wstring err;
+    if (!SaveSnapshotFile(g_paths.dailySnap, cur, err)) { Out(L"[!] " + err); return EXIT_PRECHECK; }
+    WriteReadable(g_paths.dailyTxt, cur, L"DisplaySwitch 日常模式基准配置");
+    std::wstring merr;
+    if (!SaveMonitorStateFile(g_paths.dailyMon, EnumMonitorDevices(), merr))
+        Out(L"[i] 提示: 监视器设备状态未能保存（" + merr + L"）");
+    Out(L"[OK] 已保存日常模式基准：");
+    PrintRows(DescribeSnapshot(cur));
+    Out(L"     文件: " + g_paths.dailySnap.wstring());
+    return EXIT_OK;
+}
+
+int CmdStretch(const Config& cfg);
+
+int CmdDaily(const Config& cfg);
+
+int CmdStatus(const Config& cfg)
+{
+    LiveState ls;
+    if (!ReadLive(ls)) { Out(L"[!] 无法读取当前显示配置"); return EXIT_PRECHECK; }
+
+    Out(L"==== 当前状态 ====");
+    PrintRows(ls.rows);
+    PrintMonitorDevices();
+
+    std::wstring mode;
+    if (ls.internalActive) mode = L"日常（内置屏处于启用状态）";
+    else                  mode = L"拉伸（内置屏已禁用）";
+    Out(L"  判定: " + mode);
+
+    // 与日常基准对比
+    Snapshot d;
+    std::wstring err;
+    if (LoadSnapshotFile(g_paths.dailySnap, d, err)) {
+        Out(LiveMatches(d, ls) ? L"  与日常基准: 完全一致"
+                               : L"  与日常基准: 不一致（运行 daily 可还原）");
+    } else {
+        Out(L"  与日常基准: 尚未保存基准（" + err + L"）");
+    }
+
+    // 与拉伸目标对比
+    {
+        std::wstring tgt = cfg.stretchTarget;
+        if (tgt == L"auto") tgt = (ls.externalActive > 0) ? L"external" : L"internal";
+        UINT32 w = (tgt == L"internal") ? ls.internalW : ls.externalW;
+        UINT32 h = (tgt == L"internal") ? ls.internalH : ls.externalH;
+        UINT32 hz = (tgt == L"internal") ? ls.internalHz : ls.externalHz;
+        bool internalOff = (tgt == L"external") ? !ls.internalActive : true;
+        if (internalOff && w == cfg.stretchW && h == cfg.stretchH) {
+            Out(Fmt(L"  与拉伸目标: 已一致 (%ux%u@%uHz)", w, h, hz));
+        } else {
+            Out(Fmt(L"  与拉伸目标: 不一致（目标 %s -> %ux%u，当前 %s %ux%u）",
+                    tgt == L"internal" ? L"内置屏" : L"外接屏",
+                    cfg.stretchW, cfg.stretchH,
+                    tgt == L"internal" ? L"内置屏" : L"外接屏",
+                    w, h));
+        }
+    }
+    return EXIT_OK;
+}
+
+int CmdEmergentlyRestore()
+{
+    Snapshot rb;
+    std::wstring err;
+    if (!LoadSnapshotFile(g_paths.rollbackSnap, rb, err)) {
+        Out(L"[!] 找不到回滚快照: " + err);
+        Out(L"    尝试用「扩展模式」+ 恢复日常基准分辨率...");
+        LONG tr = ApplyTopologyExtend();
+        if (tr != ERROR_SUCCESS) { Out(L"[X] 恢复失败: " + Widen(WinErrText(tr))); return EXIT_ROLLBACK_FAIL; }
+        Snapshot d;
+        if (LoadSnapshotFile(g_paths.dailySnap, d, err)) {
+            std::wstring detail;
+            RollbackTo(d, g_paths.rollbackMon, detail);
+        }
+        Out(L"[OK] 已恢复为扩展模式，请再执行一次 daily 让分辨率回到日常值。");
+        return EXIT_OK;
+    }
+    std::wstring detail;
+    if (RollbackTo(rb, g_paths.rollbackMon, detail)) {
+        Out(L"[OK] 紧急恢复成功（" + detail + L"）");
+        return EXIT_OK;
+    }
+    Out(L"[X] 紧急恢复失败: " + detail);
+    return EXIT_ROLLBACK_FAIL;
+}
+
+int CmdOpenNvcp()
+{
+    Out(L"正在打开 NVIDIA 控制面板 ...");
+    const wchar_t* tries[] = {
+        L"nvcplui.exe",
+        L"explorer.exe",
+    };
+    // 1) 传统 Win32 控制面板
+    HINSTANCE h = ShellExecuteW(nullptr, L"open", L"nvcplui.exe", nullptr, nullptr, SW_SHOWNORMAL);
+    if ((INT_PTR)h > 32) return EXIT_OK;
+    // 2) Microsoft Store 版控制面板
+    HINSTANCE h2 = ShellExecuteW(nullptr, L"open", L"explorer.exe",
+                                 L"shell:AppsFolder\\NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj!NVIDIACorp.NVIDIAControlPanel",
+                                 nullptr, SW_SHOWNORMAL);
+    if ((INT_PTR)h2 > 32) return EXIT_OK;
+    Out(L"[!] 没能自动打开 NVIDIA 控制面板。请手工打开：");
+    Out(L"    桌面右键 -> NVIDIA 控制面板 -> 显示 -> 更改分辨率 -> 自定义");
+    (void)tries;
+    return EXIT_PRECHECK;
+}
+
+// ===========================================================================
+// 8. 提权
+// ===========================================================================
+bool IsElevated()
+{
+    BOOL admin = FALSE;
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    PSID sid = nullptr;
+    if (AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+                                 0, 0, 0, 0, 0, 0, &sid)) {
+        CheckTokenMembership(nullptr, sid, &admin);
+        FreeSid(sid);
+    }
+    return admin != FALSE;
+}
+
+bool RelaunchElevated(const std::vector<std::wstring>& args, DWORD& childExit, bool wait)
+{
+    childExit = EXIT_OK;
+    std::wstring params;
+    for (const auto& a : args) {
+        if (!params.empty()) params += L" ";
+        params += QuoteArg(a);
+    }
+    params += L" --elevated";
+
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize       = sizeof(sei);
+    sei.fMask        = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.lpVerb       = L"runas";
+    sei.lpFile       = g_paths.exePath.c_str();
+    sei.lpParameters = params.c_str();
+    sei.lpDirectory  = g_paths.dir.c_str();
+    sei.nShow        = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) {
+        Out(L"[!] 请求管理员权限失败或被取消（可在右键菜单中选择「以管理员身份运行」）。");
+        return false;
+    }
+    if (sei.hProcess) {
+        if (wait) {
+            WaitForSingleObject(sei.hProcess, INFINITE);
+            DWORD code = 0;
+            GetExitCodeProcess(sei.hProcess, &code);
+            childExit = code;
+        }
+        CloseHandle(sei.hProcess);
+    }
+    return true;
+}
+
+// ===========================================================================
+// 9. 主流程：拉伸 / 日常
+// ===========================================================================
+// 把「当前状态」写成回滚点
+bool WriteRollbackPoint(std::wstring& err)
+{
+    Snapshot cur;
+    LONG r = QueryConfig(QDC_ONLY_ACTIVE_PATHS, cur.paths, cur.modes);
+    if (r != ERROR_SUCCESS) { err = L"无法读取当前配置"; return false; }
+    if (cur.empty()) { err = L"当前没有活动显示器"; return false; }
+    if (!SaveSnapshotFile(g_paths.rollbackSnap, cur, err)) return false;
+    WriteReadable(g_paths.rollbackTxt, cur, L"切换前的回滚点");
+    // 同时记下每个「监视器」设备的启用/禁用状态，回滚时一并还原
+    std::wstring merr;
+    SaveMonitorStateFile(g_paths.rollbackMon, EnumMonitorDevices(), merr);
+    return true;
+}
+
+std::wstring ListResolutions(const std::vector<GdiMode>& modes, size_t maxShow)
+{
+    std::vector<std::wstring> uniq;
+    for (const auto& m : modes) {
+        std::wstring t = Fmt(L"%ux%u", m.w, m.h);
+        if (std::find(uniq.begin(), uniq.end(), t) == uniq.end()) uniq.push_back(t);
+    }
+    std::wstring s;
+    for (size_t i = 0; i < uniq.size() && i < maxShow; ++i) { if (!s.empty()) s += L" "; s += uniq[i]; }
+    if (uniq.size() > maxShow) s += Fmt(L" ...(共 %zu 种)", uniq.size());
+    return s;
+}
+
+// 决定拉伸分辨率输出到哪块屏
+bool ResolveStretchTarget(const Config& cfg, const LiveState& live,
+                                 std::wstring& gdiName, UINT32& curW, UINT32& curH,
+                                 bool& needDisableInternal, std::wstring& why)
+{
+    std::wstring mode = cfg.stretchTarget;
+    if (mode == L"auto") mode = (live.externalActive > 0) ? L"external" : L"internal";
+
+    if (mode == L"external") {
+        if (live.externalActive == 0) {
+            why = L"当前没有活动的【外接显示器】，无法在外接屏上做拉伸。\n"
+                  L"    请先接好游戏用的外接屏 / 电视 / 采集卡；\n"
+                  L"    如果你的玩法就是直接在笔记本内置屏上拉伸，请把 display.cfg 里的\n"
+                  L"    stretch_target=external 改成 stretch_target=internal。";
+            return false;
+        }
+        gdiName = live.externalGdi;
+        curW    = live.externalW;
+        curH    = live.externalH;
+        // 内置屏还亮着 -> 按配置决定是否关掉它（关掉后只剩外接屏）
+        needDisableInternal = cfg.keepExternalOnly && live.internalActive;
+        why = L"外接显示器 " + gdiName;
+        return true;
+    }
+
+    // internal：目标就是笔记本内置屏，绝不禁用它（否则会黑屏）
+    if (!live.internalActive || live.internalGdi.empty()) {
+        why = L"笔记本内置显示器当前不是活动状态，无法作为拉伸目标。";
+        return false;
+    }
+    gdiName = live.internalGdi;
+    curW    = live.internalW;
+    curH    = live.internalH;
+    needDisableInternal = false;
+    why = L"笔记本内置显示器 " + gdiName;
+    return true;
+}
+
+int CmdStretch(const Config& cfg)
+{
+    Out(L"== 切换到【真实拉伸】模式 ==");
+    Out(Fmt(L"   目标分辨率 %ux%u   输出到 %s",
+            cfg.stretchW, cfg.stretchH,
+            cfg.stretchTarget == L"internal" ? L"笔记本内置屏" :
+            cfg.stretchTarget == L"auto"     ? L"自动判断"     : L"外接显示器"));
+
+    LiveState before;
+    if (!ReadLive(before)) { Out(L"[!] 无法读取当前显示配置"); return EXIT_PRECHECK; }
+
+    std::wstring gdi, why;
+    UINT32 curW = 0, curH = 0;
+    bool needDisable = false;
+    if (!ResolveStretchTarget(cfg, before, gdi, curW, curH, needDisable, why)) {
+        Out(L"[!] " + why);
+        return EXIT_PRECHECK;
+    }
+    Out(L"   拉伸目标: " + why + Fmt(L"（当前 %ux%u）", curW, curH));
+
+    // 先找到目标显示器对应的「监视器」设备节点（禁用它才能让自定义分辨率生效）
+    std::vector<MonitorDev> monDevs;
+    int  monIdx = -1;
+    bool monAlreadyDisabled = false;
+    if (cfg.stretchDisableMonitor) {
+        monDevs = EnumMonitorDevices();
+        for (const auto& r : before.rows) {
+            if (!r.active || r.gdi.empty()) continue;
+            if (r.gdi == gdi) { monIdx = MatchMonitorDev(monDevs, r); break; }
+        }
+        if (monIdx < 0) {
+            for (const auto& r : before.rows) {
+                if (r.active && r.internal) { monIdx = MatchMonitorDev(monDevs, r); break; }
+            }
+        }
+        if (monIdx >= 0) monAlreadyDisabled = monDevs[monIdx].disabled;
+    }
+    bool needDisableMon = cfg.stretchDisableMonitor && monIdx >= 0 &&
+                          !monDevs[monIdx].disabled && monDevs[monIdx].disableable;
+
+    if (!needDisable && !needDisableMon && curW == cfg.stretchW && curH == cfg.stretchH) {
+        Out(L"[OK] 当前已经是拉伸模式，无需切换。");
+        return EXIT_OK;
+    }
+
+    // 1) 记录回滚点（任何一步失败都能靠它退回来）
+    std::wstring err;
+    if (!WriteRollbackPoint(err)) {
+        Out(L"[!] 无法建立回滚点: " + err);
+        return EXIT_PRECHECK;
+    }
+    Snapshot rollback;
+    LoadSnapshotFile(g_paths.rollbackSnap, rollback, err);
+
+    int totalSteps = 1 + (needDisable ? 1 : 0) + (needDisableMon ? 1 : 0);
+    int step = 1;
+
+    // 2) 禁用笔记本内置显示器的显卡输出（仅 stretch_target=external 时会走到）
+    if (needDisable) {
+        Out(L"   [" + std::to_wstring(step) + L"/" + std::to_wstring(totalSteps) + L"] 禁用笔记本内置显示器（显卡输出）...");
+        LONG r = ApplyTopologyExternal();
+        if (r != ERROR_SUCCESS) {
+            Out(Fmt(L"         SDC_TOPOLOGY_EXTERNAL 失败 (%s)，改用显式停用内置屏 ...", WinErrText(r).c_str()));
+            r = ApplyDeactivateInternal(before.snap);
+        }
+        if (r != ERROR_SUCCESS) {
+            Out(Fmt(L"   [X] 禁用内置显示器失败: %s", WinErrText(r).c_str()));
+            std::wstring detail;
+            bool rb = RollbackTo(rollback, g_paths.rollbackMon, detail);
+            Out(L"   [回滚] " + detail);
+            if (g_lastErrorNeedsAdmin) { Out(L"       需要管理员权限。"); return EXIT_ELEVATION; }
+            return rb ? EXIT_APPLY_FAILED : EXIT_ROLLBACK_FAIL;
+        }
+        Sleep(cfg.settleMs);
+
+        LiveState mid;
+        if (!ReadLive(mid) || mid.externalGdi.empty()) {
+            Out(L"   [X] 内置屏已禁用，但随后找不到活动的非内置显示器。");
+            std::wstring detail;
+            bool rb = RollbackTo(rollback, g_paths.rollbackMon, detail);
+            Out(L"   [回滚] " + detail);
+            return rb ? EXIT_APPLY_FAILED : EXIT_ROLLBACK_FAIL;
+        }
+        gdi  = mid.externalGdi;
+        curW = mid.externalW;
+        curH = mid.externalH;
+        ++step;
+    }
+
+    // 3) 禁用目标显示器的「监视器」设备 —— 去掉 EDID 对分辨率的限制
+    if (cfg.stretchDisableMonitor) {
+        if (needDisableMon) {
+            Out(L"   [" + std::to_wstring(step) + L"/" + std::to_wstring(totalSteps) + L"] 禁用监视器设备 " +
+                monDevs[monIdx].instanceId + L" ...");
+            std::wstring merr;
+            if (!SetMonitorDisabled(monDevs[monIdx], true, merr)) {
+                Out(L"   [X] " + merr);
+                std::wstring detail;
+                bool rb = RollbackTo(rollback, g_paths.rollbackMon, detail);
+                Out(L"   [回滚] " + detail);
+                if (merr.find(L"管理员") != std::wstring::npos) return EXIT_ELEVATION;
+                return rb ? EXIT_APPLY_FAILED : EXIT_ROLLBACK_FAIL;
+            }
+            Out(L"         已禁用（EDID 限制解除）");
+            Sleep(800);
+            ++step;
+        } else if (monIdx < 0) {
+            Out(L"   [i] 未匹配到对应的「监视器」设备，跳过禁用步骤（只改分辨率）。");
+            Out(L"       如需手工指定，可在 display.cfg 里设置 monitor_match=<实例ID片段>");
+        } else if (monAlreadyDisabled) {
+            Out(L"   [i] 监视器设备已处于禁用状态，跳过。");
+        } else {
+            Out(L"   [!] 该监视器设备不支持禁用（DN_DISABLEABLE 未置位），跳过。");
+        }
+    }
+
+    // 4) 设置目标分辨率
+    Out(L"   [" + std::to_wstring(step) + L"/" + std::to_wstring(totalSteps) + L"] 在 " + gdi + L" 上应用分辨率 ...");
+
+    // --hard：完全断开再重新挂载显示器，强制驱动重建模式表。
+    // 这是「禁用监视器」仍不足以让自定义分辨率出现时的最后手段（会短暂黑屏）。
+    if (g_hardReset) {
+        Out(L"         --hard：先断开所有显示输出，再按回滚快照重新挂载 ...");
+        LONG dr = DetachAllDisplays();
+        if (dr != ERROR_SUCCESS) {
+            Out(Fmt(L"         断开失败: %s，跳过本步骤", WinErrText(dr).c_str()));
+        } else {
+            Sleep(1500);
+            LONG rr = ApplySnapshotCcd(rollback, false);
+            if (rr != ERROR_SUCCESS) rr = ApplySnapshotCcd(rollback, true);
+            Sleep(1800);
+            LiveState rt;
+            if (!(ReadLive(rt) && (rt.internalActive || rt.externalActive > 0))) {
+                Out(L"   [X] 重新挂载显示器失败，画面可能没有恢复。");
+                Out(L"       请等待几秒；若仍黑屏，请合盖睡眠再唤醒，或直接重启电脑。");
+                Out(L"       配置已写入 rollback.ccd，重启后可运行 emergency 还原。");
+                return EXIT_ROLLBACK_FAIL;
+            }
+            Out(L"         显示器已重新挂载。");
+            LiveState re;
+            if (ReadLive(re)) {
+                if (cfg.stretchTarget == L"internal" && !re.internalGdi.empty()) gdi = re.internalGdi;
+                else if (!re.externalGdi.empty())                                gdi = re.externalGdi;
+            }
+        }
+    }
+
+    auto modes = EnumGdiModes(gdi);
+    GdiMode pick;
+    bool found = PickGdiMode(modes, cfg.stretchW, cfg.stretchH, cfg.stretchHz, pick);
+    if (!found) {
+        // 删掉监视器设备后模式表可能还没刷新，强制系统重新枚举一次
+        Out(L"         模式表里暂时没有该分辨率，强制重新枚举显示模式 ...");
+        LONG fr = ForceModeReenumeration();
+        if (fr == ERROR_SUCCESS) {
+            Sleep(cfg.settleMs);
+            LiveState re;
+            if (ReadLive(re)) {
+                if (cfg.stretchTarget == L"internal" && !re.internalGdi.empty())     gdi = re.internalGdi;
+                else if (!re.externalGdi.empty())                                    gdi = re.externalGdi;
+            }
+            modes = EnumGdiModes(gdi);
+            found = PickGdiMode(modes, cfg.stretchW, cfg.stretchH, cfg.stretchHz, pick);
+        } else {
+            Out(Fmt(L"         重新枚举失败: %s", WinErrText(fr).c_str()));
+        }
+    }
+    if (!found) {
+        Out(Fmt(L"   [X] 该显示器当前不支持 %ux%u。", cfg.stretchW, cfg.stretchH));
+        Out(L"       它当前支持的常见分辨率: " + ListResolutions(modes));
+        Out(L"       处理方法：打开 NVIDIA 控制面板 -> 显示 -> 更改分辨率 -> 自定义，");
+        Out(L"                 新建 " + Fmt(L"%ux%u", cfg.stretchW, cfg.stretchH) + L"，然后重新运行本命令。");
+        std::wstring detail;
+        bool rb = RollbackTo(rollback, g_paths.rollbackMon, detail);
+        Out(L"   [回滚] " + detail);
+        if (cfg.openNvcpOnMissing) CmdOpenNvcp();
+        return rb ? EXIT_PRECHECK : EXIT_ROLLBACK_FAIL;
+    }
+    Out(Fmt(L"         选用模式 %ux%u @ %uHz", pick.w, pick.h, pick.hz));
+
+    LONG cr = ApplyGdiMode(gdi, pick);
+    if (cr != DISP_CHANGE_SUCCESSFUL) {
+        Out(Fmt(L"         直接设置失败 (%s)，改用“不写注册表”方式重试 ...", DispChangeText(cr).c_str()));
+        cr = ApplyGdiMode(gdi, pick, 0);
+    }
+    if (cr != DISP_CHANGE_SUCCESSFUL) {
+        Out(Fmt(L"   [X] 设置分辨率失败: %s", DispChangeText(cr).c_str()));
+        std::wstring detail;
+        bool rb = RollbackTo(rollback, g_paths.rollbackMon, detail);
+        Out(L"   [回滚] " + detail);
+        if (g_lastErrorNeedsAdmin) { Out(L"       需要管理员权限。"); return EXIT_ELEVATION; }
+        return rb ? EXIT_APPLY_FAILED : EXIT_ROLLBACK_FAIL;
+    }
+
+    // 4) 校验（显示器重配置是异步的，先等一会儿）
+    Sleep(cfg.settleMs);
+    Out(L"         ... 等待 " + std::to_wstring(cfg.settleMs) + L" ms 后校验");
+    LiveState after;
+    if (!ReadLive(after)) {
+        Out(L"   [!] 校验时读不到显示配置，先按成功处理");
+    } else {
+        bool ok = true;
+        if (needDisable && after.internalActive) { ok = false; Out(L"   [!] 内置显示器仍处于启用状态"); }
+        UINT32 gotW = (cfg.stretchTarget == L"internal" || (cfg.stretchTarget == L"auto" && after.externalActive == 0))
+                        ? after.internalW : after.externalW;
+        UINT32 gotH = (cfg.stretchTarget == L"internal" || (cfg.stretchTarget == L"auto" && after.externalActive == 0))
+                        ? after.internalH : after.externalH;
+        if (gotW != cfg.stretchW || gotH != cfg.stretchH) {
+            ok = false;
+            Out(Fmt(L"   [!] 实际分辨率是 %ux%u，与目标 %ux%u 不一致", gotW, gotH, cfg.stretchW, cfg.stretchH));
+        }
+        if (!ok) {
+            Out(L"   [X] 校验不通过，自动回滚到切换前的状态 ...");
+            std::wstring detail;
+            bool rb = RollbackTo(rollback, g_paths.rollbackMon, detail);
+            Out(L"   [回滚] " + detail);
+            return rb ? EXIT_APPLY_FAILED : EXIT_ROLLBACK_FAIL;
+        }
+    }
+
+    Out(L"[OK] 已进入【真实拉伸】模式。");
+    Out(Fmt(L"     画面输出: %s -> %ux%u", gdi.c_str(), cfg.stretchW, cfg.stretchH));
+    Out(L"     玩完之后运行 daily（或双击 run-daily.bat）即可回到日常模式。");
+    return EXIT_OK;
+}
+
+int CmdDaily(const Config& cfg)
+{
+    Out(L"== 切换回【日常】模式 ==");
+
+    Snapshot daily;
+    std::wstring err;
+    bool haveSnap = LoadSnapshotFile(g_paths.dailySnap, daily, err);
+
+    LiveState before;
+    if (!ReadLive(before)) { Out(L"[!] 无法读取当前显示配置"); return EXIT_PRECHECK; }
+
+    // 找出被禁用的「监视器」设备（拉伸时被我们关掉的那个）
+    std::vector<MonitorDev> monDevs = EnumMonitorDevices();
+    int monIdx = -1;
+    if (cfg.dailyEnableMonitor) {
+        for (const auto& r : before.rows) {
+            if (!r.active) continue;
+            if (r.internal) { monIdx = MatchMonitorDev(monDevs, r); break; }
+        }
+        if (monIdx < 0) {
+            for (size_t i = 0; i < monDevs.size(); ++i)
+                if (monDevs[i].disabled) { monIdx = (int)i; break; }
+        }
+    }
+    bool needEnableMon = cfg.dailyEnableMonitor && monIdx >= 0 && monDevs[monIdx].disabled;
+
+    if (haveSnap && LiveMatches(daily, before) && !needEnableMon) {
+        Out(L"[OK] 当前已经是日常模式，无需切换。");
+        PrintRows(before.rows);
+        return EXIT_OK;
+    }
+
+    if (!haveSnap) {
+        Out(L"[!] 没有找到日常配置基准（" + err + L"）");
+        Out(L"    将使用降级方案：切回扩展模式并按 daily.txt 尽量还原分辨率。");
+        Out(L"    建议本次成功后，在日常状态下执行一次:  DisplaySwitch.exe save");
+    }
+
+    // 记录回滚点（万一还原失败，至少能退回当前画面）
+    std::wstring rberr;
+    if (!WriteRollbackPoint(rberr)) Out(L"[i] 提示: 未能建立回滚点（" + rberr + L"）");
+
+    bool applied = false;
+
+    // 步骤 1：处理「监视器」设备
+    if (cfg.dailyEnableMonitor) {
+        // 按配置明确要求：把目标显示器的监视器设备启用回来（恢复 EDID）
+        if (needEnableMon) {
+            Out(L"   重新启用监视器设备 " + monDevs[monIdx].instanceId + L" ...");
+            std::wstring merr;
+            if (!SetMonitorDisabled(monDevs[monIdx], false, merr)) {
+                Out(L"   [!] " + merr);
+                if (merr.find(L"管理员") != std::wstring::npos) return EXIT_ELEVATION;
+            } else {
+                Out(L"         已启用");
+            }
+            Sleep(cfg.settleMs);
+        } else if (monIdx >= 0) {
+            Out(L"   [i] 监视器设备已处于启用状态，跳过。");
+        } else {
+            Out(L"   [i] 未匹配到对应的监视器设备，跳过。");
+        }
+    } else {
+        // 没要求启用：直接按 save 时记录的监视器状态还原
+        std::error_code ec2;
+        if (fs::exists(g_paths.dailyMon, ec2)) {
+            std::wstring md;
+            RestoreMonitorState(g_paths.dailyMon, md);
+            Out(L"   监视器设备: " + md);
+            Sleep(600);
+        }
+    }
+
+    // 步骤 2：用存档精确还原拓扑 + 分辨率
+    if (haveSnap) {
+        Out(L"   按存档还原显示器拓扑与分辨率 ...");
+        LONG r = ApplySnapshotCcd(daily, false);
+        if (r != ERROR_SUCCESS) {
+            Out(Fmt(L"         严格还原失败 (%s)，放宽限制重试 ...", WinErrText(r).c_str()));
+            r = ApplySnapshotCcd(daily, true);
+        }
+        if (r != ERROR_SUCCESS) {
+            Out(Fmt(L"         存档还原失败: %s", WinErrText(r).c_str()));
+        }
+        Sleep(cfg.settleMs);
+
+        LiveState t;
+        if (ReadLive(t) && LiveMatches(daily, t)) applied = true;
+    }
+
+    // 步骤 3：降级 —— 先切扩展模式把内置屏拉回来，再逐屏设分辨率
+    if (!applied) {
+        Out(L"   降级方案：切回扩展模式并逐屏还原分辨率 ...");
+        LONG tr = ApplyTopologyExtend();
+        if (tr != ERROR_SUCCESS) {
+            Out(Fmt(L"   [X] 切换扩展模式失败: %s", WinErrText(tr).c_str()));
+            if (g_lastErrorNeedsAdmin) { Out(L"       需要管理员权限。"); return EXIT_ELEVATION; }
+            Out(L"    可尝试: 按 Win+P 手动选择“扩展”，或重启电脑。");
+            return EXIT_APPLY_FAILED;
+        }
+        Sleep(cfg.settleMs);
+
+        auto rows = haveSnap ? DescribeSnapshot(daily) : ReadReadableRows(g_paths.dailyTxt);
+        if (rows.empty()) {
+            Out(L"        没有可参考的目标分辨率，交由 Windows 自行选择。");
+        }
+        for (const auto& row : rows) {
+            if (!row.active || row.gdi.empty() || row.width == 0) continue;
+            GdiMode m;
+            m.w = row.width; m.h = row.height; m.bpp = 32; m.hz = row.refresh ? row.refresh : 60;
+            GdiMode pick;
+            auto avail = EnumGdiModes(row.gdi);
+            if (PickGdiMode(avail, m.w, m.h, m.hz, pick)) m = pick;
+            LONG cr = ApplyGdiMode(row.gdi, m);
+            Out(Fmt(L"         %s -> %ux%u@%uHz : %s",
+                    row.gdi.c_str(), m.w, m.h, m.hz, DispChangeText(cr).c_str()));
+            Sleep(300);
+        }
+        Sleep(cfg.settleMs);
+    }
+
+    // 校验
+    LiveState after;
+    if (!ReadLive(after)) {
+        Out(L"[X] 校验时读不到显示配置。");
+        return EXIT_APPLY_FAILED;
+    }
+    bool ok = true;
+    if (haveSnap) {
+        ok = LiveMatches(daily, after);
+    } else {
+        ok = after.internalActive;
+    }
+    if (!ok) {
+        Out(L"[X] 校验失败：显示状态与日常基准不一致。");
+        if (!after.internalActive) Out(L"     笔记本内置屏仍未恢复。");
+        Out(L"     可尝试: (1) 按 Win+P 选择“扩展”；(2) 运行  DisplaySwitch.exe emergency；(3) 重启。");
+        return EXIT_APPLY_FAILED;
+    }
+
+    Out(L"[OK] 已回到【日常】模式。");
+    PrintRows(after.rows);
+    return EXIT_OK;
+}
+
+int CmdToggle(const Config& cfg)
+{
+    LiveState ls;
+    if (!ReadLive(ls)) { Out(L"[!] 无法读取当前显示配置"); return EXIT_PRECHECK; }
+
+    // 判断依据是「画面本身」而不是「内置屏是否亮着」：
+    //   因为在内置屏拉伸的玩法下，内置屏全程都是活动的，只是分辨率变了，
+    //   用 internalActive 判断会导致永远往拉伸方向走（曾经的真实 bug）。
+    std::wstring tgt = cfg.stretchTarget;
+    if (tgt == L"auto") tgt = (ls.externalActive > 0) ? L"external" : L"internal";
+
+    UINT32 w = (tgt == L"internal") ? ls.internalW : ls.externalW;
+    UINT32 h = (tgt == L"internal") ? ls.internalH : ls.externalH;
+    const wchar_t* which = (tgt == L"internal") ? L"内置屏" : L"外接屏";
+
+    if (w == cfg.stretchW && h == cfg.stretchH) {
+        Out(Fmt(L"[i] %s 当前 %ux%u，就是拉伸画面 -> 切回日常模式", which, w, h));
+        return CmdDaily(cfg);
+    }
+    if (tgt == L"external" && !ls.internalActive) {
+        Out(L"[i] 内置屏的显卡输出已关闭 -> 切回日常模式");
+        return CmdDaily(cfg);
+    }
+
+    Out(Fmt(L"[i] %s 当前 %ux%u，不是拉伸画面 -> 切到拉伸模式", which, w, h));
+    return CmdStretch(cfg);
+}

@@ -1,0 +1,29 @@
+# ===== 编译产物 =====
+/build/
+*.o
+*.obj
+*.res
+
+# ===== 运行时生成的文件（每台机器不同，不要提交）=====
+# 日志
+DisplaySwitch.log
+*.log
+# 日常基准快照（CCD 拓扑 + 监视器设备状态）
+daily.ccd
+daily.mon
+daily.txt
+# 回滚点（每次切换前自动生成）
+rollback.ccd
+rollback.mon
+rollback.txt
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+Desktop.ini
+
+# ===== 打包产物 =====
+*.zip
