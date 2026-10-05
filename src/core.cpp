@@ -163,24 +163,27 @@ std::wstring Fmt(const wchar_t* fmt, ...)
     return std::wstring(buf);
 }
 
-std::string WinErrText(LONG code)
+// 取系统错误码的可读描述。
+// 注意：这里必须返回 std::wstring —— 之前返回 std::string，调用方却把它塞进
+//       宽字符版 Fmt(L"...%s...")，%s 在 _vsnwprintf_s 里按 wchar_t* 解释，
+//       于是每个 ASCII 字节被当成 UTF-16 码元，日志里就出现
+//       “㜸⠠迥낕铩꾯胣⦂”这种乱码，还会越界读到缓冲区外的脏数据。
+std::wstring WinErrText(LONG code)
 {
-    if (code == 0) return "ERROR_SUCCESS";
-    LPWSTR msg = nullptr;
+    if (code == 0) return L"0 (成功)";
+    wchar_t* msg = nullptr;
     DWORD n = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
                              FORMAT_MESSAGE_IGNORE_INSERTS,
                              nullptr, (DWORD)code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
                              (LPWSTR)&msg, 0, nullptr);
-    std::string s;
+    std::wstring s;
     if (n && msg) {
-        std::wstring w(msg, n);
-        while (!w.empty() && (w.back() == L'\r' || w.back() == L'\n' || w.back() == L' ')) w.pop_back();
-        s = Narrow(w);
+        s.assign(msg, n);
+        while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n' || s.back() == L' ')) s.pop_back();
     }
     if (msg) LocalFree(msg);
-    if (s.empty()) s = "未知错误";
-    return Fmt(L"错误码 %ld (%s)", code, Widen(s).c_str()).empty() ? s
-               : Narrow(Fmt(L"%ld (%s)", code, Widen(s).c_str()));
+    if (s.empty()) s = L"未知错误";
+    return Fmt(L"%ld (%s)", code, s.c_str());
 }
 
 // ===========================================================================
@@ -581,8 +584,120 @@ bool SaveSnapshotFile(const fs::path& file, const Snapshot& s, std::wstring& err
     return true;
 }
 
-bool LoadSnapshotFile(const fs::path& file, Snapshot& s, std::wstring& err)
+// --- 适配器 LUID 重映射 -----------------------------------------------------
+// 为什么需要它（本项目踩过的最大的坑）：
+//   DISPLAYCONFIG_PATH_INFO 里的 adapterId 是个 LUID，**每次重启 Windows 都会
+//   重新分配**。存档里存的是当时的 LUID，重启之后这个 LUID 在本机已经不存在了，
+//   再拿它去调 SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG) 会直接返回
+//   ERROR_INVALID_PARAMETER(87)，表现就是「拉伸进得去、日常回不来」。
+//   实测：把存档里的旧 LUID 换成本机当前 LUID 后，同一个快照立刻校验通过。
+//   所以这里在读取存档后统一做一次重映射，让上层完全不用关心 LUID 这回事。
+//
+// 匹配策略：
+//   1) 优先按 target id 匹配 —— 同一块屏的 target id 在同一台机器上通常稳定；
+//   2) 匹配不到、且本机只有一个显示适配器时，直接整体换过去（绝大多数笔记本）；
+//   3) 都不行就放弃（返回 false），由上层走降级方案，绝不硬套一个错的 LUID。
+
+static bool SameLuid(const LUID& a, const LUID& b)
 {
+    return a.LowPart == b.LowPart && a.HighPart == b.HighPart;
+}
+
+// 收集本机当前所有显示适配器的 LUID（来自所有路径，含未激活的）
+static std::vector<LUID> LiveAdapters()
+{
+    std::vector<LUID> out;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (QueryConfig(QDC_ALL_PATHS, paths, modes) != ERROR_SUCCESS) return out;
+    for (const auto& q : paths) {
+        bool dup = false;
+        for (const auto& a : out) if (SameLuid(a, q.sourceInfo.adapterId)) { dup = true; break; }
+        if (!dup) out.push_back(q.sourceInfo.adapterId);
+    }
+    return out;
+}
+
+bool IsLiveAdapter(const LUID& luid)
+{
+    for (const auto& a : LiveAdapters()) if (SameLuid(a, luid)) return true;
+    return false;
+}
+
+// 返回 true = 快照可用（可能做过重映射）；false = 快照里的 LUID 无法安全修正
+static bool RemapSnapshotAdapters(Snapshot& s, std::wstring& note)
+{
+    note.clear();
+    if (s.paths.empty()) return true;
+
+    std::vector<LUID> adapters = LiveAdapters();
+    if (adapters.empty()) return true;          // 查不到就原样试，别乱改
+
+    auto isLive = [&](const LUID& l) {
+        for (const auto& a : adapters) if (SameLuid(a, l)) return true;
+        return false;
+    };
+    bool anyStale = false;
+    for (const auto& q : s.paths) if (!isLive(q.sourceInfo.adapterId)) { anyStale = true; break; }
+    if (!anyStale) return true;                 // LUID 还有效，无需处理
+
+    // 用于把 modes 里的 LUID 一起改掉
+    std::vector<std::pair<LUID, LUID>> remap;
+
+    for (auto& q : s.paths) {
+        LUID oldL = q.sourceInfo.adapterId;
+        if (isLive(oldL)) continue;
+
+        LUID nl{};
+        bool found = false;
+
+        // 策略 1：按 target id 匹配
+        {
+            std::vector<LUID> hits;
+            std::vector<DISPLAYCONFIG_PATH_INFO> lp;
+            std::vector<DISPLAYCONFIG_MODE_INFO> lm;
+            if (QueryConfig(QDC_ALL_PATHS, lp, lm) == ERROR_SUCCESS) {
+                for (const auto& e : lp) {
+                    if (e.targetInfo.id != q.targetInfo.id) continue;
+                    bool dup = false;
+                    for (const auto& h : hits) if (SameLuid(h, e.sourceInfo.adapterId)) { dup = true; break; }
+                    if (!dup) hits.push_back(e.sourceInfo.adapterId);
+                }
+            }
+            if (hits.size() == 1) { nl = hits[0]; found = true; }
+        }
+        // 策略 2：本机只有一个适配器
+        if (!found && adapters.size() == 1) { nl = adapters[0]; found = true; }
+
+        if (!found) {
+            note = Fmt(L"存档里的适配器 LUID 已失效（通常是重启过），但本机现在有 %u 个显示适配器，"
+                       L"无法安全判断该重映射到哪一个。\n"
+                       L"       请在日常分辨率下重新执行一次 save 刷新基准。",
+                       (unsigned)adapters.size());
+            return false;
+        }
+
+        q.sourceInfo.adapterId = nl;
+        q.targetInfo.adapterId = nl;
+        bool dup = false;
+        for (const auto& e : remap) if (SameLuid(e.first, oldL)) { dup = true; break; }
+        if (!dup) remap.push_back({oldL, nl});
+    }
+
+    for (auto& m : s.modes) {
+        for (const auto& e : remap) if (SameLuid(m.adapterId, e.first)) { m.adapterId = e.second; break; }
+    }
+
+    if (!remap.empty()) {
+        note = Fmt(L"存档的适配器 LUID 已过期（多半是重启过），已自动重映射到当前适配器 %08X%08X",
+                   (unsigned)remap[0].second.HighPart, (unsigned)remap[0].second.LowPart);
+    }
+    return true;
+}
+
+bool LoadSnapshotFile(const fs::path& file, Snapshot& s, std::wstring& err, bool* remapped)
+{
+    if (remapped) *remapped = false;
     std::ifstream f(file, std::ios::binary);
     if (!f) { err = L"找不到存档文件: " + file.wstring(); return false; }
 
@@ -610,6 +725,14 @@ bool LoadSnapshotFile(const fs::path& file, Snapshot& s, std::wstring& err)
     s.modes.assign(hd.numModes, DISPLAYCONFIG_MODE_INFO{});
     if (pbytes) memcpy(s.paths.data(), payload.data(), pbytes);
     if (mbytes) memcpy(s.modes.data(), payload.data() + pbytes, mbytes);
+
+    // 关键一步：把存档里的 LUID 换成本机当前有效的 LUID（重启后会变）
+    std::wstring note;
+    if (!RemapSnapshotAdapters(s, note)) { err = note; return false; }
+    if (!note.empty()) {
+        Out(L"   [i] " + note);
+        if (remapped) *remapped = true;
+    }
     return true;
 }
 
@@ -944,35 +1067,60 @@ static bool g_lastErrorNeedsAdmin = false;
 
 LONG ApplySnapshotCcd(const Snapshot& s, bool allowChanges)
 {
+    if (s.paths.empty()) return ERROR_INVALID_PARAMETER;
+
+    // 注意：快照在 LoadSnapshotFile 里已经做过 LUID 重映射，这里拿到的就是本机当前
+    //       有效的 adapterId。
+    //
+    // flag 组合是实测出来的（配合 tools/probe_ccd.cpp 逐个组合试过）：
+    //   SDC_PATH_PERSIST_IF_REQUIRED   + SDC_USE_SUPPLIED_DISPLAY_CONFIG -> 87 ✗
+    //   SDC_ALLOW_PATH_ORDER_CHANGES   + SDC_USE_SUPPLIED_DISPLAY_CONFIG -> 87 ✗
+    //   SDC_ALLOW_CHANGES              + SDC_USE_SUPPLIED_DISPLAY_CONFIG -> 0  ✓
+    // 也就是说原来「放宽限制重试」时加的那两个 flag 恰恰是把调用弄坏的原因，
+    // 所以这里只保留 SDC_ALLOW_CHANGES。
     UINT32 flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE;
-    if (allowChanges) flags |= SDC_ALLOW_CHANGES | SDC_PATH_PERSIST_IF_REQUIRED | SDC_ALLOW_PATH_ORDER_CHANGES;
+    if (allowChanges) flags |= SDC_ALLOW_CHANGES;
+
+    // SetDisplayConfig 的入参不是 const，这里各自拷一份
     std::vector<DISPLAYCONFIG_PATH_INFO> paths = s.paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes = s.modes;
-    LONG r = SetDisplayConfig((UINT32)paths.size(), paths.empty() ? nullptr : paths.data(),
-                              (UINT32)modes.size(), modes.empty() ? nullptr : modes.data(), flags);
+
+    // 先用 SDC_VALIDATE 干跑一遍：参数不合法时它不改动任何东西，
+    // 免得 SDC_APPLY 改到一半失败、把画面留在半成品状态。
+    // 注意 SDC_VALIDATE 和 SDC_APPLY 互斥，必须先把 SDC_APPLY 摘掉，否则同样返回 87。
+    LONG v = SetDisplayConfig((UINT32)paths.size(), paths.data(),
+                              (UINT32)modes.size(), modes.data(),
+                              (flags & ~(UINT32)SDC_APPLY) | (UINT32)SDC_VALIDATE);
+    if (v != ERROR_SUCCESS) return v;
+
+    LONG r = SetDisplayConfig((UINT32)paths.size(), paths.data(),
+                              (UINT32)modes.size(), modes.data(), flags);
     if (r == ERROR_ACCESS_DENIED) g_lastErrorNeedsAdmin = true;
     return r;
 }
 
 LONG ApplyTopologyExternal()
 {
-    LONG r = SetDisplayConfig(0, nullptr, 0, nullptr,
-                              SDC_TOPOLOGY_EXTERNAL | SDC_APPLY | SDC_SAVE_TO_DATABASE);
-    if (r == ERROR_ACCESS_DENIED) {
-        g_lastErrorNeedsAdmin = true;
-        r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTERNAL | SDC_APPLY);
-    }
+    // SDC_TOPOLOGY_* 不能和 SDC_SAVE_TO_DATABASE 一起用（实测返回 87），
+    // 需要落库的话得改用 SDC_TOPOLOGY_SUPPLIED + 显式路径数组。
+    LONG r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTERNAL | SDC_APPLY);
+    if (r == ERROR_ACCESS_DENIED) g_lastErrorNeedsAdmin = true;
     return r;
 }
 
 LONG ApplyTopologyExtend()
 {
-    LONG r = SetDisplayConfig(0, nullptr, 0, nullptr,
-                              SDC_TOPOLOGY_EXTEND | SDC_APPLY | SDC_SAVE_TO_DATABASE);
-    if (r == ERROR_ACCESS_DENIED) {
-        g_lastErrorNeedsAdmin = true;
-        r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
-    }
+    LONG r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
+    if (r == ERROR_ACCESS_DENIED) g_lastErrorNeedsAdmin = true;
+    return r;
+}
+
+// 单显示器机器上 SDC_TOPOLOGY_EXTEND 会返回 ERROR_GEN_FAILURE，这时改用
+// SDC_TOPOLOGY_INTERNAL 把内置屏拉回来更靠谱。
+LONG ApplyTopologyInternal()
+{
+    LONG r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_TOPOLOGY_INTERNAL | SDC_APPLY);
+    if (r == ERROR_ACCESS_DENIED) g_lastErrorNeedsAdmin = true;
     return r;
 }
 
@@ -1349,7 +1497,7 @@ int CmdEmergentlyRestore()
         Out(L"[!] 找不到回滚快照: " + err);
         Out(L"    尝试用「扩展模式」+ 恢复日常基准分辨率...");
         LONG tr = ApplyTopologyExtend();
-        if (tr != ERROR_SUCCESS) { Out(L"[X] 恢复失败: " + Widen(WinErrText(tr))); return EXIT_ROLLBACK_FAIL; }
+        if (tr != ERROR_SUCCESS) { Out(L"[X] 恢复失败: " + WinErrText(tr)); return EXIT_ROLLBACK_FAIL; }
         Snapshot d;
         if (LoadSnapshotFile(g_paths.dailySnap, d, err)) {
             std::wstring detail;
@@ -1739,7 +1887,8 @@ int CmdDaily(const Config& cfg)
 
     Snapshot daily;
     std::wstring err;
-    bool haveSnap = LoadSnapshotFile(g_paths.dailySnap, daily, err);
+    bool snapRemapped = false;
+    bool haveSnap = LoadSnapshotFile(g_paths.dailySnap, daily, err, &snapRemapped);
 
     LiveState before;
     if (!ReadLive(before)) { Out(L"[!] 无法读取当前显示配置"); return EXIT_PRECHECK; }
@@ -1811,11 +1960,14 @@ int CmdDaily(const Config& cfg)
         Out(L"   按存档还原显示器拓扑与分辨率 ...");
         LONG r = ApplySnapshotCcd(daily, false);
         if (r != ERROR_SUCCESS) {
-            Out(Fmt(L"         严格还原失败 (%s)，放宽限制重试 ...", WinErrText(r).c_str()));
+            Out(Fmt(L"         严格还原失败 (%s)，换成宽松参数再试一次 ...", WinErrText(r).c_str()));
             r = ApplySnapshotCcd(daily, true);
         }
         if (r != ERROR_SUCCESS) {
             Out(Fmt(L"         存档还原失败: %s", WinErrText(r).c_str()));
+            if (r == ERROR_INVALID_PARAMETER)
+                Out(L"         提示: 存档里的显示器信息和本机现状对不上（重启后 LUID 会变），"
+                    L"下面走降级方案。");
         }
         Sleep(cfg.settleMs);
 
@@ -1823,19 +1975,34 @@ int CmdDaily(const Config& cfg)
         if (ReadLive(t) && LiveMatches(daily, t)) applied = true;
     }
 
-    // 步骤 3：降级 —— 先切扩展模式把内置屏拉回来，再逐屏设分辨率
+    // 步骤 3：降级 —— 存档不可用时的兜底
     if (!applied) {
-        Out(L"   降级方案：切回扩展模式并逐屏还原分辨率 ...");
-        LONG tr = ApplyTopologyExtend();
-        if (tr != ERROR_SUCCESS) {
-            Out(Fmt(L"   [X] 切换扩展模式失败: %s", WinErrText(tr).c_str()));
-            if (g_lastErrorNeedsAdmin) { Out(L"       需要管理员权限。"); return EXIT_ELEVATION; }
-            Out(L"    可尝试: 按 Win+P 手动选择“扩展”，或重启电脑。");
-            return EXIT_APPLY_FAILED;
+        // 3a) 内置屏还亮着（stretch_target=internal 的玩法全程如此）
+        //     -> 完全不需要动拓扑，直接逐屏设 GDI 分辨率就行。
+        //     单显示器机器上 SDC_TOPOLOGY_EXTEND 会返回 31，硬走拓扑只会白白失败。
+        if (before.internalActive) {
+            Out(L"   降级方案：内置屏仍在工作，直接按日常基准逐屏设分辨率 ...");
+        } else {
+            Out(L"   降级方案：内置屏没亮，先把它拉回来 ...");
+            LONG tr = ApplyTopologyExtend();
+            if (tr != ERROR_SUCCESS) {
+                Out(Fmt(L"         SDC_TOPOLOGY_EXTEND 失败 (%s)，改用 SDC_TOPOLOGY_INTERNAL ...",
+                        WinErrText(tr).c_str()));
+                tr = ApplyTopologyInternal();
+            }
+            if (tr != ERROR_SUCCESS) {
+                Out(Fmt(L"   [X] 拉回内置屏失败: %s", WinErrText(tr).c_str()));
+                if (g_lastErrorNeedsAdmin) { Out(L"       需要管理员权限。"); return EXIT_ELEVATION; }
+                Out(L"    可尝试: 按 Win+P 手动选择“仅电脑屏幕”或“扩展”，或重启电脑。");
+                return EXIT_APPLY_FAILED;
+            }
+            Sleep(cfg.settleMs);
         }
-        Sleep(cfg.settleMs);
 
-        auto rows = haveSnap ? DescribeSnapshot(daily) : ReadReadableRows(g_paths.dailyTxt);
+        // 优先用 daily.txt：里面存的是纯文本的 \\.\DISPLAYn 名字，不依赖存档里的 LUID，
+        // 所以在「存档失效」这个降级场景里反而更可靠。
+        std::vector<DisplayRow> rows = ReadReadableRows(g_paths.dailyTxt);
+        if (rows.empty() && haveSnap) rows = DescribeSnapshot(daily);
         if (rows.empty()) {
             Out(L"        没有可参考的目标分辨率，交由 Windows 自行选择。");
         }
@@ -1875,6 +2042,21 @@ int CmdDaily(const Config& cfg)
 
     Out(L"[OK] 已回到【日常】模式。");
     PrintRows(after.rows);
+
+    // 自愈：如果刚才读存档时发现 LUID 过期（重启过），说明磁盘上的 daily.ccd 已经
+    // 不再匹配本机。既然此刻画面已经校验确认为日常状态，就顺手把基准刷新一遍，
+    // 免得下次回日常又要走一遍降级流程。
+    if (snapRemapped) {
+        Snapshot now;
+        std::wstring serr;
+        if (QueryConfig(QDC_ONLY_ACTIVE_PATHS, now.paths, now.modes) == ERROR_SUCCESS &&
+            !now.paths.empty() && SaveSnapshotFile(g_paths.dailySnap, now, serr)) {
+            WriteReadable(g_paths.dailyTxt, now, L"DisplaySwitch 日常模式基准配置");
+            Out(L"     [i] 已顺手刷新日常基准存档（适配器 LUID 已更新），以后回日常不会再报错。");
+        } else {
+            Out(L"     [i] 提示: 磁盘上的日常基准存档仍是重启前的，建议再执行一次 save 刷新。");
+        }
+    }
     return EXIT_OK;
 }
 

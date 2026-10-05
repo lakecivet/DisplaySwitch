@@ -249,14 +249,27 @@ hotkey=Ctrl+Alt+S           # 全局热键（仅图形版）
 ### 切回【日常】
 1. 读当前状态，按 `daily.mon` 存档还原监视器设备状态（本机保持禁用，**不需要管理员**）。
 2. 按 `daily.ccd` 存档精确还原显示拓扑 + 分辨率。
-3. 校验；不一致就走降级方案（切扩展模式 → 逐屏还原分辨率）。
+   读存档时会自动做一次 **LUID 重映射** —— 存档里的 `adapterId` 是保存时的显卡 LUID，
+   而 Windows **每次重启都会重新分配**，映射回当前值之后这份旧存档才能继续用。
+3. 校验；不一致就走降级方案（见下）。
+4. 如果刚才确实做了 LUID 重映射，且画面已校验为日常状态，会**顺手把 `daily.ccd` 刷新一遍**
+   （自愈），下次回日常就是干净的成功路径。
 
-### 三级降级回滚
+### 降级回滚
 任何一步失败都会按顺序尝试：
 
-1. **严格还原**：用回滚快照调 `SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG)`。
-2. **放宽还原**：加上 `SDC_ALLOW_CHANGES | SDC_PATH_PERSIST_IF_REQUIRED | SDC_ALLOW_PATH_ORDER_CHANGES` 重试。
-3. **拓扑兜底**：切到「扩展模式」把内置屏拉回来，再逐屏设分辨率。
+1. **严格还原**：用快照调 `SetDisplayConfig(SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE)`。
+   调用前先用 `SDC_VALIDATE` 干跑一遍，参数不合法就直接跳过，不会把画面留在半成品状态。
+2. **宽松还原**：加 `SDC_ALLOW_CHANGES` 重试。
+3. **降级兜底**：
+   - 内置屏**还亮着**（`stretch_target=internal` 的拉伸玩法全程如此）→ 不动拓扑，直接按
+     `daily.txt` 逐屏 `ChangeDisplaySettingsExW` 设回分辨率；
+   - 内置屏**没亮** → 先 `SDC_TOPOLOGY_EXTEND`（失败再试 `SDC_TOPOLOGY_INTERNAL`）把它拉回来，再设分辨率。
+
+> ⚠️ 有几个 CCD flag 组合是**必然返回 87（参数错误）**的，别再用：
+> `SDC_PATH_PERSIST_IF_REQUIRED` / `SDC_ALLOW_PATH_ORDER_CHANGES`（与 `SDC_USE_SUPPLIED_DISPLAY_CONFIG` 同用）、
+> `SDC_SAVE_TO_DATABASE`（与 `SDC_TOPOLOGY_*` 同用）、以及 `SDC_VALIDATE` 与 `SDC_APPLY` 同用。
+> 这些结论是用 `tools/probe_ccd.cpp` 逐个组合实测出来的。
 
 存档文件用「二进制快照 + `FNV-1a` 哈希校验」，文件损坏会被发现并拒用，不会拿着坏数据乱改你的显示配置。
 
@@ -278,6 +291,18 @@ hotkey=Ctrl+Alt+S           # 全局热键（仅图形版）
 
 **Q：点了切换没反应？**
 看 `DisplaySwitch.log` 最后几行，或者双击 `run-check.bat`。退出码含义见第 5 节。
+
+**Q：重启之后「回日常」一直失败（退出码 3）？**
+v1.2 已修。原因是 `daily.ccd` 里存的是保存时的**显卡 LUID**，而 Windows 每次重启都会重新分配，
+旧 LUID 再拿去调 `SetDisplayConfig` 就返回 `87（参数错误）`。
+现在读存档时会自动重映射，并且在第一次成功回日常后自动刷新基准存档。
+如果你手上的版本日志里还出现 `㜸⠠迥낕铩꾯胣⦂` 这种乱码，那就是 v1.1 或更早，更新即可。
+另外任何时候都可以在日常分辨率下跑一次 `DisplaySwitchCLI.exe save` 手动重建基准。
+
+**Q：明明没动设置，拉伸目标分辨率却变了？**
+图形界面右侧「可用分辨率」列表里**点一下**就会把该分辨率填进上方的「拉伸分辨率」输入框
+（v1.2 起会写一条日志提示）。要让改动永久生效，还得点「保存设置到 display.cfg」；
+不点的话下次启动会读回原值。
 
 **Q：弹了 UAC 窗口？**
 说明这一步需要管理员权限（正在禁用/启用监视器设备）。**允许它**，程序会在提权后的新进程里把操作做完。
@@ -329,6 +354,20 @@ Y:/msys64/ucrt64/bin/g++.exe -std=c++17 -O2 -DUNICODE -D_UNICODE \
 
 图标缺失时用 `python tools/make_icon.py` 重新生成（纯标准库，不需要 Pillow）。
 
+### 显示配置诊断工具 `tools/probe_ccd.cpp`
+
+排查「切换失败」时用它，**全程只读**（所有调用都带 `SDC_VALIDATE`，不会改动任何显示设置）：
+
+```bash
+Y:/msys64/ucrt64/bin/g++.exe -std=c++17 -O2 -DUNICODE -D_UNICODE -static -s \
+    tools/probe_ccd.cpp -o build/probe_ccd.exe -luser32 -lgdi32
+cd D:/DisplaySwitch && ./build/probe_ccd.exe
+```
+
+它会打印：当前活动的显示路径（LUID / source id / target id / GDI 名）、
+`daily.ccd` 里的 LUID 与当前是否一致、以及各组 CCD flag 组合的返回码。
+本项目那几个「必然返回 87」的 flag 组合就是这么找出来的。
+
 > ⚠️ 所有 `.bat` 脚本都**必须保持纯 ASCII**（连 `rem` 注释都不能有中文）。
 > `cmd.exe` 是按系统 OEM 代码页（中文系统是 GBK）读 `.bat` 的，UTF-8 中文会被解析成乱码，
 > 直接报 `'岄潰' 不是内部或外部命令`，而且会**打断 `^` 行续接**，让整段命令散架。
@@ -339,6 +378,12 @@ Y:/msys64/ucrt64/bin/g++.exe -std=c++17 -O2 -DUNICODE -D_UNICODE \
 ## 11. 技术要点
 
 - **显示拓扑 / 分辨率**：`QueryDisplayConfig` / `SetDisplayConfig` / `ChangeDisplaySettingsExW`
+- **适配器 LUID 不可跨重启缓存**：`DISPLAYCONFIG_PATH_INFO` 的 `adapterId` 是 LUID，
+  每次重启都会变；存档里的旧 LUID 必须重映射成当前值，否则 `SetDisplayConfig` 直接返回 `87`。
+  这是本项目最大的一个坑，`core.cpp` 的 `RemapSnapshotAdapters()` 专门处理它
+- **CCD flag 有互斥关系**：`SDC_VALIDATE` 与 `SDC_APPLY` 互斥；`SDC_TOPOLOGY_*` 不能配 `SDC_SAVE_TO_DATABASE`；
+  `SDC_PATH_PERSIST_IF_REQUIRED` / `SDC_ALLOW_PATH_ORDER_CHANGES` 与 `SDC_USE_SUPPLIED_DISPLAY_CONFIG` 同用会失败。
+  全都在 `SDC_VALIDATE` 下实测过（`tools/probe_ccd.cpp`）
 - **监视器设备开关**：`SetupDiGetClassDevs(GUID_DEVCLASS_MONITOR)` + `CM_Disable_DevNode` / `CM_Enable_DevNode`
 - **内置屏识别**：现代笔记本的内屏报 `DISPLAYPORT_EMBEDDED`(11) 而不是 `INTERNAL`，所以判断要覆盖 INTERNAL / LVDS / DISPLAYPORT_EMBEDDED / UDI_EMBEDDED 四种
 - **提权**：`ShellExecuteExW("runas")`，子进程带 `--elevated` 标记避免无限递归；父进程等待子进程退出并回传退出码

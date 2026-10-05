@@ -510,11 +510,19 @@ static void RegisterGlobalHotkey()
 // ---------------------------------------------------------------------------
 static void SyncCfgFromUI()
 {
-    g_cfg.stretchW = (UINT32)_wtoi(GetWndText(hEditW).c_str());
-    g_cfg.stretchH = (UINT32)_wtoi(GetWndText(hEditH).c_str());
+    // 只有解析出「看起来像分辨率」的值才覆盖 g_cfg。
+    // 否则输入框被清空、或填了非数字时，_wtoi 会返回 0，再被下面的下限钳成 320x200，
+    // 于是拉伸目标就被悄悄改成一个垃圾值 —— 这类"顺手改配置"是最难查的 bug。
+    UINT32 w = (UINT32)_wtoi(GetWndText(hEditW).c_str());
+    UINT32 h = (UINT32)_wtoi(GetWndText(hEditH).c_str());
+    if (w >= 320 && h >= 200) {
+        g_cfg.stretchW = w;
+        g_cfg.stretchH = h;
+    } else {
+        AppendLogLine(Fmt(L"[!] 拉伸分辨率输入无效（宽需 >=320、高需 >=200），沿用原值 %ux%u",
+                          g_cfg.stretchW, g_cfg.stretchH));
+    }
     g_cfg.stretchHz = (UINT32)_wtoi(GetWndText(hEditHz).c_str());
-    if (g_cfg.stretchW < 320) g_cfg.stretchW = 320;
-    if (g_cfg.stretchH < 200) g_cfg.stretchH = 200;
     g_cfg.logEnabled = IsDlgButtonChecked(g_hwnd, IDC_CHK_LOG) == BST_CHECKED;
     g_cfg.autoElevate = IsDlgButtonChecked(g_hwnd, IDC_CHK_ELEV) == BST_CHECKED;
     g_cfg.stretchDisableMonitor = IsDlgButtonChecked(g_hwnd, IDC_CHK_DISMON) == BST_CHECKED;
@@ -1286,6 +1294,11 @@ static void OnCommand(int id, int code)
                     SetWndText(hEditW, std::to_wstring(w));
                     SetWndText(hEditH, std::to_wstring(h));
                     SetWndText(hEditHz, std::to_wstring(hz));
+                    // 列表只是「可选项」，点一下就会写进上面的输入框。以前这是静默发生的，
+                    // 很容易出现「明明没改设置，拉伸目标却变了」的困惑，所以这里明确报一句。
+                    AppendLogLine(Fmt(L"[i] 已把拉伸分辨率填成 %ux%u@%uHz。"
+                                      L"要让下次启动也生效，请点底部「保存设置到 display.cfg」。",
+                                      w, h, hz));
                 }
             }
         }

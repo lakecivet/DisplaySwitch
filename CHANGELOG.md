@@ -1,5 +1,52 @@
 # 更新日志
 
+## v1.2 — 2026-10-06
+
+### 修复：重启后「回日常」必然失败（退出码 3）
+
+现象：拉伸能进去，回日常永远失败，日志里是一串乱码：
+
+```
+严格还原失败 (㜸⠠迥낕铩꾯胣⦂)，放宽限制重试 ...
+存档还原失败: 㜸⠠迥낕铩꾯胣⦂
+降级方案：切回扩展模式并逐屏还原分辨率 ...
+[X] 切换扩展模式失败: 㜸⠠迥낕铩꾯胣⦂
+```
+
+其实是**三个叠加的 bug**：
+
+1. **存档跨重启失效（根因）**
+   `DISPLAYCONFIG_PATH_INFO` 里的 `adapterId` 是个 LUID，**每次重启 Windows 都会重新分配**。
+   `daily.ccd` 存的是保存时的 LUID，重启后再拿去调
+   `SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG)` 会直接返回
+   `ERROR_INVALID_PARAMETER (87)`。
+   → 新增**自动 LUID 重映射**：读存档时把旧 LUID 换成本机当前 LUID
+     （先按 target id 匹配，匹配不到且本机只有一个适配器时整体替换）。
+   → 回日常成功后还会**顺手刷新基准存档**，实现自愈。
+
+2. **flag 组合本来就非法**
+   `SDC_PATH_PERSIST_IF_REQUIRED` / `SDC_ALLOW_PATH_ORDER_CHANGES` 一旦和
+   `SDC_USE_SUPPLIED_DISPLAY_CONFIG` 同时出现就是 87；`SDC_TOPOLOGY_*` 也不能和
+   `SDC_SAVE_TO_DATABASE` 一起用。
+   也就是说原来的「放宽限制重试」和「降级切扩展模式」两条路**从来没成功过**。
+   （用 `tools/probe_ccd.cpp` 逐个组合试出来的。）
+
+3. **错误信息乱码**
+   `WinErrText()` 返回 `std::string`，却被塞进宽字符版 `Fmt(L"...%s...")`，
+   `%s` 按 `wchar_t*` 解释 → 每个 ASCII 字节当成一个 UTF-16 码元，
+   既显示乱码又会**越界读缓冲区**。已改为返回 `std::wstring`。
+
+### 其它改进
+- `ApplySnapshotCcd` 先跑一遍 `SDC_VALIDATE` 干跑校验，参数不合法就不动手，
+  避免 `SDC_APPLY` 改到一半把画面留在半成品状态
+- 降级路径重做：**内置屏还亮着时不再去动拓扑**（拉伸玩法全程如此），
+  直接逐屏设 GDI 分辨率；单显示器机器上 `SDC_TOPOLOGY_EXTEND` 会返回 31，硬走只会白失败
+- 降级时优先读 `daily.txt`（纯文本 `\\.\DISPLAYn`，不依赖 LUID）
+- 图形界面：分辨率输入框被清空/填了非数字时**不再把拉伸目标悄悄改成 320x200**
+- 图形界面：在「可用分辨率」列表里点一下会明确写一条日志，说明它改了拉伸分辨率
+- 新增 `tools/probe_ccd.cpp`：只读诊断工具，用 `SDC_VALIDATE` 逐项验证 CCD 调用，
+  不改动任何显示设置
+
 ## v1.1 — 2026-10-05
 
 ### 图形界面美化

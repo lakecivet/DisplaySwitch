@@ -180,7 +180,9 @@ bool                    SetMonitorDisabled(const MonitorDev& m, bool disable, st
 bool ReadLive(LiveState& ls);
 bool LiveMatches(const Snapshot& want, const LiveState& live);
 
-bool LoadSnapshotFile(const fs::path& file, Snapshot& s, std::wstring& err);
+// remapped（可选出参）= 存档里的适配器 LUID 已过期、读取时被自动重映射过
+//                      （重启后 Windows 会重新分配 LUID，属正常现象）
+bool LoadSnapshotFile(const fs::path& file, Snapshot& s, std::wstring& err, bool* remapped = nullptr);
 
 // ---------------------------------------------------------------------------
 // 各命令（返回值即退出码）
